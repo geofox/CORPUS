@@ -20,6 +20,7 @@
    5. [API surface](#45-api-surface)
    6. [Staff UI](#46-staff-ui)
    7. [Infra, CI/CD, local dev workflow](#47-infra-cicd-local-dev-workflow)
+   8. [AI Companion](#48-ai-companion)
 5. [Testing strategy](#5-testing-strategy)
 6. [Deferred / future sub-projects](#6-deferred--future-sub-projects)
 7. [Decisions log](#7-decisions-log)
@@ -193,16 +194,18 @@ CORPUS runs as a small set of Compose services on a Linux host. Azure mapping is
 
 - **`User`** — staff member. `id`, `email` (unique citext), `display_name`, `team_id`, `is_admin`, `external_id` (nullable, OIDC sub when Entra lands), `is_active`, timestamps.
 - **`Team`** — internal BIPT team. `id`, `slug` (`complaint`, `dsa`, `ai`, `market`), `display_name`, `description`, timestamps.
-- **`Party`** — any entity referenced in a case. `id`, `kind` enum `individual | organization | authority`, `display_name`, `language` enum `nl | fr | en | de`, `email`, `phone`, `address` jsonb, `metadata` jsonb, `is_anonymized` bool, `anonymized_at`, timestamps.
-- **`Case`** — the complaint aggregate. `id`, `reference` unique (`CORPUS-2026-0042`), `title`, `description`, `category_id` FK, `status` enum `draft | open | closed`, `received_at`, `closed_at`, `created_by_user_id` (nullable), `is_escalated` bool, `escalation_level` enum `team_lead | council | leadership` (nullable), `escalated_at` (nullable), `escalated_by_user_id` (nullable), `escalation_reason` (nullable), timestamps.
+- **`Party`** — any entity referenced in a case. `id`, `kind` enum `individual | organization | authority`, `display_name`, `language` enum `nl | fr | en | de`, `email`, `phone`, `address` jsonb, `metadata` jsonb, `is_anonymized` bool, `anonymized_at`, `ai_opt_out` bool default false (when true on a Party playing the `complainant` role, every case they're on gets AI disabled — the data subject has refused AI processing), `ai_opt_out_recorded_at` nullable, `ai_opt_out_source` enum `intake_form | staff_manual | email_reply | other` nullable, timestamps.
+- **`Case`** — the complaint aggregate. `id`, `reference` unique (`CORPUS-2026-0042`), `title`, `description`, `category_id` FK, `status` enum `draft | open | closed`, `received_at`, `closed_at`, `created_by_user_id` (nullable), `is_escalated` bool, `escalation_level` enum `team_lead | council | leadership` (nullable), `escalated_at` (nullable), `escalated_by_user_id` (nullable), `escalation_reason` (nullable), `ai_disabled` bool default false (effective flag: true if explicitly set OR any complainant Party has `ai_opt_out=true`; computed+stored so the UI check is a single column read), `ai_disabled_reason` text nullable (`complainant_opt_out | staff_decision | policy | other`), `ai_disabled_at` nullable, `ai_disabled_by_user_id` nullable FK, timestamps.
 - **`CaseCategory`** — seeded taxonomy. `id`, `slug` (`dsa`, `ai-act`, `data-act`), `display_name`, `description`, timestamps.
 - **`CaseParticipant`** — party's role on a case. `id`, `case_id`, `party_id`, `role` enum `complainant | target | authority | cc | other`, `added_at`, `metadata` jsonb. Unique on `(case_id, party_id, role)`.
-- **`Event`** — append-only timeline. `id`, `case_id`, `sequence_number` (per-case monotonic bigint), `event_type` (dotted namespace), `actor_type` enum `user | system | party`, `actor_user_id` (nullable), `actor_party_id` (nullable), `payload` jsonb, `occurred_at`, `recorded_at`. **No `UPDATE`/`DELETE` allowed.**
+- **`Event`** — append-only timeline. `id`, `case_id`, `sequence_number` (per-case monotonic bigint), `event_type` (dotted namespace), `actor_type` enum `user | system | party`, `actor_user_id` (nullable), `actor_party_id` (nullable), `via_ai_agent_id` (nullable FK AIAgent — set when a human action was AI-assisted), `from_interaction_id` (nullable FK AIInteraction — specific invocation that produced content the user used), `payload` jsonb, `occurred_at`, `recorded_at`. **No `UPDATE`/`DELETE` allowed.** The AI fields preserve the "human is always the actor" principle (§4.8) while making AI assistance auditable.
 - **`Attachment`** — evidence. `id`, `case_id`, `event_id` (nullable), `original_filename`, `content_type` (sniffed, not trusted), `size_bytes`, `checksum_sha256`, `storage_key` (opaque UUID-based), `category_id` FK (NOT NULL, defaults to `other`), `is_internal` bool (never shareable externally when true), `uploaded_by_user_id`, `uploaded_by_party_id` (for future intake/email), `description`, `is_deleted` bool (soft delete), `deleted_at`, `deleted_by_user_id`, timestamps.
 - **`AttachmentCategory`** — admin-managed. `id`, `slug`, `display_name`, `description`, `is_system` (prevents deletion), `display_order`, timestamps. Seeded: `evidence`, `correspondence`, `contract`, `screenshot`, `internal_note`, `other`.
 - **`ProcessInstance`** — one process running on a case. `id`, `case_id`, `process_id`, `process_version`, `current_state`, `status` enum `running | completed | cancelled | error`, `kind` enum `main | spawned | triggered`, `parent_instance_id` (nullable, for sub-processes), `context` jsonb, `started_at`, `ended_at`, timestamps. **Partial unique index**: `(case_id) WHERE kind = 'main' AND status = 'running'` — one main per case. **Multiple concurrent instances are allowed** (main + spawned + triggered).
 - **`Task`** — work item. `id`, `process_instance_id`, `case_id` (denormalized), `task_key`, `title`, `description`, `assigned_to_user_id` (nullable), `assigned_to_team_id` (nullable), `status` enum `open | claimed | completed | cancelled`, `outcome` (drives transitions), `data` jsonb (form data), `created_at`, `claimed_at`, `completed_at`, `completed_by_user_id`.
 - **`Template`** — correspondence text (text only v0; email subject field reserved). `id`, `slug`, `language` enum `nl | fr | en | de`, `subject` (nullable), `body` (Jinja2 placeholders; rendering via the `jinja2` package with an autoescaped, sandboxed environment), timestamps. Unique on `(slug, language)`.
+- **`AIAgent`** — a configured LLM endpoint that the AI Companion can invoke. `id`, `slug` (`summarizer`, `translator`, `analyst`…), `display_name`, `description`, `provider` enum `openai | anthropic | azure_openai | dummy`, `model` (e.g., `gpt-4o`, `claude-opus-4-7`), `endpoint` nullable (for Azure / proxy), `api_key_secret_ref` (**name** of the env var or Key Vault secret holding the key; the key itself is never in the DB), `default_prompt_prefix` nullable (system-style prefix for all invocations), `region` nullable (`eu` / `non-eu` — drives the PII warning UX), `is_active`, timestamps. See §4.8.
+- **`AIInteraction`** — append-only log of each AI Companion invocation. `id`, `case_id`, `user_id` (invoker), `agent_id` FK AIAgent, `prompt_slug` nullable (if a workflow-scoped or global prompt template was used), `prompt_version` (git rev of prompt at invocation), `interaction_kind` (`summarize | explain_attachment | draft_reply | chat | workflow_prompt`), `shared_input` jsonb (what was sent: included case fields, event ids, attachment ids — summarized, never raw), `input_hash` (sha256 of the assembled prompt), `prompt_rendered` text (the final prompt sent; internal-only), `output_text` text, `tokens_in`, `tokens_out`, `cost_estimate` nullable, `latency_ms`, `status` enum `ok | provider_error | rate_limited | cancelled`, `created_at`. See §4.8.
 
 **`ProcessDefinition` is NOT a DB table.** Process YAML files in `/processes/` are the authoritative source; loaded into an in-memory `ProcessRegistry` at app start. `ProcessInstance.process_id + process_version` pins each instance to a specific YAML.
 
@@ -216,8 +219,10 @@ CORPUS runs as a small set of Compose services on a Linux host. Azure mapping is
 - `cases(is_escalated) WHERE is_escalated = true` — dashboard escalations.
 - `parties(email)` — for dedup on ingest.
 - `attachments(case_id) WHERE is_deleted = false` — default case attachment list.
+- `ai_interactions(case_id, created_at DESC)` — case-scoped AI history, recent-first.
+- `ai_interactions(user_id, created_at DESC)` — per-user AI usage rollup for cost awareness.
 
-**Seed data on first boot (idempotent):** Teams (`complaint`, `dsa`, `ai`, `market`), case categories (`dsa`, `ai-act`, `data-act`), attachment categories, one dev user per team + one admin, Belgian region authorities (Flanders, Wallonia, Brussels), bare-bones NL/FR/EN templates for a minimal DSA flow, one demo case with a small timeline.
+**Seed data on first boot (idempotent):** Teams (`complaint`, `dsa`, `ai`, `market`), case categories (`dsa`, `ai-act`, `data-act`), attachment categories, one dev user per team + one admin, Belgian region authorities (Flanders, Wallonia, Brussels), bare-bones NL/FR/EN templates for a minimal DSA flow, one demo case with a small timeline, **one `AIAgent` (`summarizer`) using the `dummy` provider** so the AI Companion is usable out of the box without API keys; `.env.example` documents `OPENAI_API_KEY=` / `ANTHROPIC_API_KEY=` placeholders for configuring real agents.
 
 ### 4.3 Workflow DSL
 
@@ -248,6 +253,21 @@ slas:                                  # optional — deadlines as observers
     on_breach:
       - action: notify_team
         args: { team: complaint, template: sla_breach }
+ai_prompts:                            # optional — AI Companion tools scoped to this workflow (§4.8)
+  - slug: suggest_classification
+    label: "Suggest a category"
+    description: "Ask AI to propose a BIPT category from the complaint text"
+    available_at_states: [completeness_check, classification]
+    default_include:
+      case: true
+      attachments: non_internal
+      events: recent_20
+    prompt_template: |
+      You are helping BIPT triage an incoming complaint.
+      Complaint: {{ case.description }}
+      Attachments: {{ attachments_digest }}
+      Suggest the most likely category (DSA, AI Act, Data Act, …), a confidence
+      (low/medium/high), and your reasoning.
 states: [ ... ]
 ```
 
@@ -440,7 +460,8 @@ Accompanied by `/processes/forward_to_regions.yaml` (parallel Flanders/Wallonia/
 | `reminder.*` | `reminder.sent` |
 | `sla.*` | `sla.started`, `sla.breached` (shape only; firing deferred) |
 | `comment.*` | `comment.added`, `comment.edited`, `comment.deleted` |
-| `admin.*` | `admin.process_reloaded`, `admin.reassignment_override` |
+| `ai.*` | `ai.queried` (companion invocation logged), `ai.invocation_blocked` (attempt on an AI-disabled case, for audit), `case.ai_disabled`, `case.ai_enabled` (re-enablement), `party.ai_opt_out_set`, `party.ai_opt_out_cleared`. AI never acts *as* an actor — this namespace is for audit of human-invoked AI usage and of the consent/opt-out lifecycle. See §4.8. |
+| `admin.*` | `admin.process_reloaded`, `admin.reassignment_override`, `admin.ai_agent_created`, `admin.ai_agent_updated` |
 
 Each type has a JSON Schema validator in `backend/src/corpus/events/schemas/`. Unknown types fail validation at the service boundary — typo prevention.
 
@@ -535,6 +556,18 @@ Route-level authz via composable dependencies: `require_admin`, `require_team_me
 **Dashboard**
 - `GET /api/dashboard/complaint-team` — aggregated widget data in one response (filters: category, date_range). Complaint Team / admin only.
 
+**AI Companion**
+- `GET /api/ai/agents` — list active agents available to the current user.
+- `POST /api/cases/{id}/ai/interactions` — invoke. **Returns 403 `ai_disabled_for_case` if the case has `ai_disabled=true`**, emitting an `ai.invocation_blocked` event for audit. Body: `{agent_id, kind, prompt_slug?, prompt_override?, include: {case?, event_ids?, attachment_ids?}, user_message?}`. Returns rendered output + `AIInteraction` metadata.
+- `GET /api/cases/{id}/ai/interactions` — list prior interactions on this case.
+- `GET /api/ai/interactions/{id}` — detail (including `prompt_rendered`, visible only to the invoker + admins).
+- `GET /api/ai/prompts?process_id=&state=` — list globally + workflow-scoped prompts available in the given context. Returns empty list for AI-disabled cases.
+- `POST /api/cases/{id}:disable-ai` — body `{reason}`. Complaint Team or admin. Sets `ai_disabled=true`. Emits `case.ai_disabled`.
+- `POST /api/cases/{id}:enable-ai` — body `{reason}`. **Admin only** (re-enabling after opt-out requires oversight). Emits `case.ai_enabled`. Refuses if any complainant Party on the case has `ai_opt_out=true` unless the Party's opt-out is cleared first.
+- `PATCH /api/parties/{id}` — already supports `ai_opt_out` toggle. When flipped on a complainant Party, **all cases the party is on are automatically marked `ai_disabled=true`** (transactionally, emits `case.ai_disabled` per case). When cleared, disabled cases are **not** automatically re-enabled — staff must explicitly call `:enable-ai` per case, forcing a human decision.
+- `GET /api/admin/ai-agents`, `POST /api/admin/ai-agents`, `PATCH /api/admin/ai-agents/{id}` — CRUD (admin). Emits `admin.ai_agent_*` events.
+- `GET /api/admin/ai-usage?from=&to=&by=user|agent` — rollups for cost awareness. Admin only.
+
 **Error shape (RFC 7807, single envelope everywhere):**
 
 ```json
@@ -573,12 +606,14 @@ Simple, testable, generalizable when the RBAC sub-project lands.
 | `/` | other staff | **My Work** — open tasks + team queue + recent cases I touched. |
 | `/cases` | all (scoped) | Filterable table of cases. |
 | `/cases/new` | all | Create form. |
-| `/cases/:id` | scoped | **Case detail** — tabbed (Timeline default / Details / Participants / Attachments / Processes / Comments). Sticky header with reference, status, escalation badge, "Escalate", "Send reminder", "Close case" actions. |
+| `/cases/:id` | scoped | **Case detail** — tabbed (Timeline default / Details / Participants / Attachments / Processes / Comments). Sticky header with reference, status, escalation badge, "Escalate", "Send reminder", "Close case" actions. Persistent **"AI Assistant"** button opens the companion drawer (§4.8). |
 | `/tasks`, `/tasks/:id` | all | Inbox + task detail with dynamic form. |
 | `/parties`, `/parties/:id` | all | Directory + detail. |
 | `/processes`, `/processes/:id/:version` | all | Loaded processes + validation status. |
 | `/admin/categories/cases`, `/admin/categories/attachments` | admin | CRUD. |
 | `/admin/teams`, `/admin/users` | admin | Read-only v0. |
+| `/admin/ai-agents` | admin | CRUD for configured AI agents — provider, model, endpoint, secret ref, region, prompt prefix. Emits `admin.ai_agent_*` events. |
+| `/admin/ai-usage` | admin | Per-user / per-agent / per-day rollups of interactions, tokens, estimated cost. |
 
 #### 4.6.3 Complaint Team dashboard widgets
 
@@ -606,6 +641,10 @@ Row actions from dashboard tables: *open*, *escalate*, *send reminder*, *assign*
 | Task form rendering | `FormRenderer` walks typed JSON form schema from DSL, maps to shadcn inputs. |
 | Attachment upload | Drag-drop + picker; client-side size/type courtesy check; server is authoritative; progress bar; optimistic row insert on success. |
 | External event form | Modal: event_type, from_party (picker), occurred_at, summary, attachments. Submits to external-events endpoint. |
+| **AI Assistant drawer** | Right-edge slide-out drawer on case and task pages. Contents: agent picker (if >1 active), **prompt picker** (contextual workflow prompts at top when on a task page, global prompts below), "what to include" checkboxes (case text / event list / attachment list — `is_internal` excluded by default), editable prompt textarea, Send. Response panel with per-paragraph and whole-response copy buttons. Previous interactions on this case listed at the top (collapsed, most recent first). See §4.8. **When `Case.ai_disabled=true`, the button is replaced by a locked icon with tooltip "AI assistance disabled for this case" + the recorded reason.** |
+| **AI-disabled badge** | Red badge on case header when `ai_disabled=true`, showing the reason (`complainant opt-out` / `staff decision` / `policy`). Toggle-AI action in the case menu (visible to Complaint Team + admin), with distinct "Enable AI" requiring admin role. |
+| **Complainant opt-out control** | On the Party detail page (for individuals), an "AI processing opt-out" checkbox with explanatory text: "When enabled, CORPUS will not let any AI tool process this person's complaints." Source field captures how the opt-out was recorded (intake form / staff / email). |
+| **PII warning** | When the selected agent's `region` is `non-eu` and the selected includes attachments containing PII or personal Party data, a yellow banner in the drawer reminds the user that this invocation shares personal data with an external processor outside the EU. Non-blocking; logged in the interaction payload. |
 | Confirmation modals | Destructive/externally-visible actions require a `reason` text. |
 | Toasts | Single global system; errors render 7807 envelope's title/detail. |
 
@@ -747,6 +786,109 @@ BASIC_AUTH_USERS_FILE=./infra/traefik/usersfile  # used by demo profile only
 
 **Data-residency note:** Funnel terminates TLS on the local Tailscale daemon (on *this* host), not at Tailscale's servers. Traffic does not pass through Tailscale's infrastructure at the application layer — consistent with the no-MITM posture we want for a regulator's stack. Tailscale's control plane sees only connection metadata (WireGuard is peer-to-peer).
 
+### 4.8 AI Companion
+
+CORPUS ships with AI as a **companion**, not a workflow actor. AI never mutates case state and never sends external communications. It is a tool that humans invoke on demand to read, summarize, explain, translate, or draft text — the human copies what's useful into their own action. This keeps attribution clean (the human is always the actor), keeps the governance model tractable (no proposal-review machinery needed in v0), and keeps the regulator-defensibility story simple ("no autonomous AI action has ever been taken in this system").
+
+The AI-as-workflow-actor model (proposals, review flow, DSL actions that produce AI outputs consumed by the engine) is deferred to the **AI Triage sub-project (§6.4)**.
+
+#### 4.8.1 Platform principles
+
+1. **AI never writes.** Output is text for humans to read. Any state change attributed to AI-assisted human action carries `Event.via_ai_agent_id` + `from_interaction_id` — the **human is the actor**, AI is the tool used.
+2. **Every invocation is logged** with `agent_id`, `model`, `prompt_version`, `input_hash`, token counts, latency, and a summary of what was shared (`ai.queried` event + `AIInteraction` row).
+3. **Explicit data sharing.** The user picks what to include in each call. No implicit case-wide context. `is_internal` attachments excluded by default; user must opt in per call.
+4. **Non-EU endpoint warning.** The UI warns before sharing Party PII with an agent whose `region` is `non-eu`. Non-blocking (for dev flexibility), logged on the interaction.
+5. **API keys are never in the DB.** `AIAgent.api_key_secret_ref` points to an env var or Key Vault secret name.
+6. **Prompts versioned in git.** Workflow-scoped prompts live in process YAML (`ai_prompts:` block, §4.3); global prompts live in `backend/src/corpus/ai/prompts/*.j2`. Prompt changes go through PR review.
+7. **Soft per-user rate limits** (env-configurable, default e.g. 60/hour) prevent runaway loops and accidental over-use on personal keys.
+8. **Append-only interaction log.** `AIInteraction` rows are never deleted. Sensitive fields (`prompt_rendered`, raw output) are visible only to the invoker and admins via the API; the timeline's `ai.queried` event carries a summary, not the raw text.
+9. **Complainant consent.** Every complainant may opt out of AI processing for their complaints. When a complainant Party has `ai_opt_out=true`, every case they participate in is automatically set `ai_disabled=true`, and no AI invocation is permitted — the API returns 403 and emits `ai.invocation_blocked` for audit. Re-enabling a case after an opt-out is admin-only and requires clearing the Party's opt-out first. The intake form (future sub-project §6.1) will include an explicit opt-out choice; until it ships, staff record the choice on the Party when registering the complaint. This is a platform default stance; BIPT Council may formalize or alter it later (flagged in §8).
+
+#### 4.8.2 LLM client abstraction
+
+```python
+class LLMClient(Protocol):
+    def complete(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        system: str | None = None,
+        timeout_s: float = 60,
+    ) -> LLMResponse: ...
+
+@dataclass
+class LLMResponse:
+    output_text: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    provider_raw: Any          # provider-specific response; for debugging / audit
+```
+
+**Concrete clients in v0:**
+
+| Provider | Client | v0 role |
+|---|---|---|
+| `dummy` | `DummyLLMClient` | Returns canned responses keyed on `input_hash`; default agent; used in tests and CI. |
+| `openai` | `OpenAIClient` | Direct OpenAI API; user's personal key for testing. |
+| `anthropic` | `AnthropicClient` | Direct Anthropic API; user's personal key for testing. |
+| `azure_openai` | `AzureOpenAIClient` | Shape only in v0; wired by the Azure Deploy sub-project. |
+
+All four implement the same protocol. Structured outputs (JSON mode, tool-use) are **not in v0 scope** — companion invocations return free text. The AI Triage sub-project adds structured outputs when proposals need typed payloads.
+
+#### 4.8.3 Prompt model
+
+Two kinds of prompts, both rendered via Jinja2 with a sandboxed environment and a small context (`case`, `events`, `attachments_digest`, `user`, `task?`):
+
+| Kind | Lives in | Scope | Surfaced in UI |
+|---|---|---|---|
+| **Global** | `backend/src/corpus/ai/prompts/*.j2` | Always available | In the AI Assistant drawer, always |
+| **Workflow-scoped** | `ai_prompts:` block in the process YAML (§4.3) | Tied to a process; optional `available_at_states` narrows further | Only when the user is at a matching state; surfaced as one-click buttons at top of the drawer |
+
+Validation at process-load time: each `ai_prompts` entry has unique slug within file, valid `available_at_states` refs, Jinja2 parse succeeds, variables referenced exist in the context.
+
+#### 4.8.4 Interaction flow
+
+1. User opens the AI Assistant drawer on a case (or from a task).
+2. UI fetches available prompts from `GET /api/ai/prompts?process_id=X&state=Y` (if in task context) plus globals.
+3. User clicks a prompt button (or writes a free one), reviews/edits "what to include" checkboxes, hits Send.
+4. `POST /api/cases/{id}/ai/interactions` — backend:
+   a. Authz check (user has access to the case).
+   b. Resolve prompt template; render with the selected inclusions (redact `is_internal` attachments unless opted in).
+   c. Compute `input_hash`.
+   d. Check per-user rate limit.
+   e. Emit PII-warning metadata if applicable.
+   f. Call the LLM via the configured client.
+   g. Persist `AIInteraction`; emit `ai.queried` event with summary payload.
+   h. Return output + metadata.
+5. UI renders the output with copy buttons.
+6. When the user *uses* the output in an action (e.g., paste into an email draft and send it via the Send Reminder flow), that downstream action's event carries `via_ai_agent_id` + `from_interaction_id` — the AI-assist provenance.
+
+#### 4.8.5 Testing
+
+- `DummyLLMClient` used in all scenario and API tests — deterministic, no network, no keys.
+- Fixture prompts in `backend/tests/fixtures/ai_prompts/` validate the rendering pipeline.
+- Real-client tests gated behind an env flag (`TEST_LIVE_LLM=1`) and excluded from default CI — used when iterating on prompts with real providers.
+- An integration scenario: user opens assistant → selects workflow prompt → sends → interaction created → event logged → output returned → user copies → downstream event carries `via_ai_agent_id`.
+
+#### 4.8.6 Configuration (`.env` additions)
+
+```
+# Per-user invocation soft limit (dev default)
+AI_RATE_LIMIT_PER_USER_PER_HOUR=60
+
+# Personal testing keys (optional; agents pick these up by secret_ref)
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_ENDPOINT=
+```
+
+Admins create agents by configuring `AIAgent.api_key_secret_ref` to one of these env names (or a Key Vault secret name in prod). The key value itself is read from env at invocation time — never stored in the DB.
+
 ---
 
 ## 5. Testing strategy
@@ -831,12 +973,14 @@ Each entry below is a candidate for its own brainstorm → spec → plan cycle. 
 - **V0 hooks:** SLA shape parsed and validated in DSL; `start_timer`/`cancel_timer`/`on_timeout` reserved action vocabulary; `slas:` blocks loaded and stored.
 - **Key open questions:** durable scheduler choice (Celery+Redis? pg_boss? Postgres-backed custom?); timezone handling (UTC in DB, render local); business-day vs calendar-day SLAs (per-category?); reminder-cadence defaults; what should happen on engine downtime during a scheduled firing.
 
-### 6.4 AI Triage
+### 6.4 AI as workflow actor (proposal + review)
 
-- **What:** Azure OpenAI-assisted classification suggestion, summarization, completeness checks, draft acknowledgement text; human-in-the-loop review; guardrails; explainability.
-- **Depends on:** Foundations; Email I/O (natural source of unstructured text); Timers (for automated kickoff on new case).
-- **V0 hooks:** `call_ai_triage` reserved action; event shape for AI outputs; context variables on process instance.
-- **Key open questions:** model choice (gpt-4o vs gpt-4.1 in Belgium Central); prompt library governance (who reviews, who approves); audit trail for AI suggestions (every suggestion logged with model + prompt version + output); degradation policy if Azure OpenAI is down; fine-tuning vs RAG for category taxonomy knowledge; language handling for multi-lingual inputs.
+*Note: the **AI Companion** (humans invoke AI tools on demand; AI never writes) ships in **v0** — see §4.8. This sub-project adds the **workflow-actor** model: AI produces proposals that the engine surfaces as review tasks, and accepted proposals drive state changes.*
+
+- **What:** `AIProposal` entity + mandatory human review flow; DSL actions (`ai_suggest_classification`, `ai_check_completeness`, `ai_draft_acknowledgement`) that create proposals; review-task flavor with Accept/Reject/Modify/Supersede actions; structured-output LLM client support (JSON mode / tool-use); cost caps + rate limits enforced at the engine level (v0 only has soft per-user caps); per-action review-policy in DSL (`require_review: true | false`, default true); confidence thresholds that can auto-flag low-confidence proposals; prompt library governance (per-category, versioned); multi-step agentic flows.
+- **Depends on:** Foundations (AI Companion infra — LLM clients, AIAgent entity, AIInteraction log, events — already built); Email I/O (to create realistic unstructured inputs).
+- **V0 hooks:** `AIAgent` + LLM clients in place; events namespace `ai.*` in place; `call_ai_triage` / `call_ai_classify` reserved DSL action names.
+- **Key open questions:** model choice for each action (gpt-4o vs gpt-4.1 vs Claude vs open-source?); prompt library governance (who reviews, who approves); degradation policy if provider is down (fall back? pause process?); fine-tuning vs RAG for category taxonomy knowledge; **mapping complainant opt-out (§4.8 principle 9) to workflow-actor mode** — processes likely need a branch "run AI actions" vs "skip AI actions" at each AI-using state.
 
 ### 6.5 External Forwarding & Share Bundles
 
@@ -957,6 +1101,12 @@ Each decision records the *why*, so future-us can judge edge cases without re-li
 37. **`localtest.me` for dev hostnames.** Why: wildcard DNS to 127.0.0.1; no `/etc/hosts` edits.
 38. **Remote access via dedicated Tailscale sidecar in CORPUS Compose** (not shared host Tailscale, not shared production Traefik, not Cloudflare Tunnel). Why: host has both a host-level Tailscale daemon and a separate production Tailscale container already; reusing either would couple CORPUS to infra we must not disturb. A dedicated `corpus-dev` sidecar gives its own tailnet identity, its own `serve`/`funnel` rules, and a clean lifecycle (stopping CORPUS cleanly removes the device). Cloudflare Tunnel rejected because it would MITM all traffic at Cloudflare edge — problematic for a regulator's data-handling posture even in dev. Tailscale Funnel terminates TLS on the local daemon, no third-party visibility at application layer.
 39. **Basic Auth middleware active only in `demo` profile**, on top of the dev-stub auth. Why: the dev-stub auth (`X-Dev-User-Email` header) is trivially impersonable; when we expose the stack publicly via Funnel for a demo, Basic Auth provides a real access barrier. When Entra ID auth lands, Basic Auth becomes optional.
+40. **AI as Companion in v0** (humans invoke, AI returns text, humans act); **AI as workflow actor deferred to §6.4.** Why: governance shape benefits from being designed against real AI usage, not imagined; one working companion action (§4.8) proves the plumbing end-to-end without the risks of autonomous AI action. The workflow-actor model (`AIProposal` + review tasks) lands in §6.4 when there's enough real traffic to calibrate it.
+41. **Dedicated `AIAgent` entity, not `User.is_ai`.** Why: human actors and LLM endpoints are different concepts; conflating them muddies the audit log. Multiple agents (summarizer, translator, etc.) each have their own identity, model, prompt version, region.
+42. **Human is always the actor; AI is the tool.** `Event.actor_type` stays `user | system | party` — no `ai` value. Instead, events carry `via_ai_agent_id` + `from_interaction_id` to capture AI assistance provenance without muddying attribution. Why: a regulator needs clear "who decided this" answers; that answer is always a human when actions change state.
+43. **Multiple LLM client implementations in v0** (`openai`, `anthropic`, `azure_openai`, `dummy`) behind one `LLMClient` protocol. Why: user tests with personal OpenAI/Anthropic keys; `dummy` keeps tests hermetic; `azure_openai` is prod-ready config-only swap.
+44. **Workflow-scoped `ai_prompts` block in process YAML.** Why: prompts are inherently tied to the process that uses them; co-locating keeps authorship, review, and versioning in one place; contextual surfacing in the UI (prompts appear at states where they apply) improves staff usefulness.
+45. **Complainant AI opt-out is honored at case level.** Why: proposed as BIPT platform default (subject to Council confirmation): data subjects can refuse AI processing of their complaints. Technically enforced: `Party.ai_opt_out` on complainants propagates to `Case.ai_disabled`; blocks every AI invocation; re-enablement is an admin action. Building this from v0 avoids retrofitting consent plumbing when the public intake form ships.
 
 ---
 
@@ -980,6 +1130,11 @@ To resolve either before planning or during implementation. Each has a reasonabl
 14. **Frontend lint tool** — ESLint + Prettier vs Biome? *Default: ESLint + Prettier (ubiquitous); revisit if Biome reaches critical mass.*
 15. **Basic Auth users file management** — committed `.example`, gitignored real; how do we bootstrap the first credential and rotate later? *Default: `htpasswd -B` generates a bcrypt line for `.env` to write into `infra/traefik/usersfile` at container start; rotation is a file replace + Traefik reload.*
 16. **Tailscale tailnet ACL for `tag:corpus-dev`** — what should it allow/deny? *Default: allow all enrolled devices in the tailnet; tighten when real data lands.*
+17. **Non-EU endpoint detection for PII warning** — how does the UI know an agent is non-EU? *Default: admin sets `AIAgent.region` explicitly at agent creation; UI trusts that field; `dummy` agent is `eu` by convention.*
+18. **Cost estimation source** — where do we get per-token pricing for the cost_estimate field? *Default: hard-coded pricing table per (provider, model) in `backend/src/corpus/ai/pricing.py`, updated with each release; flagged as approximate in the UI.*
+19. **Complainant AI-opt-out policy, formally** — platform default now says opt-out is respected case-wide; does BIPT Council want to (a) endorse as-is, (b) require explicit opt-*in* instead (AI off by default), or (c) restrict opt-out to specific categories? *Default: opt-out respected; opt-in flip is a config toggle we can add if the Council wants.*
+20. **Clearing a complainant opt-out** — who is allowed, and what evidence is required? *Default: admin role; staff records a `reason` text; the expected justification is "written confirmation from complainant"; no automatic re-enable of case-level AI.*
+21. **Workflow-scoped prompt governance** — since `ai_prompts` live in YAML, do Complaint Team authors get direct edit access to workflows, or do they propose via PR? *Default: PR-style via git for v0; the later designer UI will formalize an in-app propose-and-approve flow.*
 
 ---
 
