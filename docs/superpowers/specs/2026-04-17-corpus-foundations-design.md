@@ -143,8 +143,9 @@ CORPUS runs as a small set of Compose services on a Linux host. Azure mapping is
 | `web` | built from `frontend/Dockerfile` | Vite dev server (HMR) in default profile; static-web-server in `prod` profile. |
 | `adminer` | `adminer` (profile: `tools`) | Browser DB inspector. |
 | `e2e` | built from `frontend/Dockerfile` (profile: `e2e`) | Playwright runner. |
+| `tailscale` | `tailscale/tailscale` (profile: `remote`, `demo`) | Tailscale sidecar with its own tailnet identity (`corpus-dev`). Traefik joins its netns via `network_mode: "service:tailscale"`, making CORPUS reachable at `corpus-dev.<tailnet>.ts.net`. See §4.7.1. |
 
-**Traefik routing via Docker labels** — each service declares its own routes; no central config to maintain. Dev hostnames via `*.localtest.me` (public DNS that resolves to 127.0.0.1 — no `/etc/hosts` editing).
+**Traefik routing via Docker labels** — each service declares its own routes; no central config to maintain. Dev hostnames via `*.localtest.me` (public DNS that resolves to 127.0.0.1 — no `/etc/hosts` editing). Remote access is opt-in via Compose profiles (§4.7.1), deliberately isolated from any existing production Traefik or Tailscale on the host.
 
 **Module boundaries inside `api`:**
 `auth` (stub), `parties`, `cases`, `events`, `attachments`, `storage` (shared infra), `workflow`, `templates`, `admin`, `dashboards`, `reminders`, `escalations`, `api` (FastAPI routers), `core` (shared: db, logging, config, errors).
@@ -668,7 +669,7 @@ open http://traefik.localtest.me:8080
 - Vitest (unit), Playwright (e2e), axe-playwright (a11y).
 - ESLint + Prettier (or Biome, team choice).
 
-**Docker Compose shape:** see §4.1. Profiles: default, `tools` (adminer), `e2e` (Playwright runner), `prod` (overlay for prod-like local).
+**Docker Compose shape:** see §4.1. Profiles: default, `tools` (adminer), `e2e` (Playwright runner), `prod` (overlay for prod-like local), `remote` (adds Tailscale sidecar for remote access — see §4.7.1), `demo` (extends `remote`: enables Basic Auth middleware and Tailscale Funnel for time-boxed public exposure).
 
 **Database & migrations:** single Postgres, with logical schema grouping by module family (proposed: `core` for cases/parties/events/attachments/templates/users/teams/categories; `workflow` for process_instances/tasks). The exact schema boundary is a detail for implementation — the intent is readable grouping, not microservice-like isolation. Alembic `env.py` aware of the split via multiple metadata objects. Autogenerate + human review. `api` entrypoint waits for db → runs `alembic upgrade head` → seeds if empty → starts Uvicorn. CI runs `alembic check` on every PR.
 
@@ -685,6 +686,66 @@ open http://traefik.localtest.me:8080
 **Observability in dev:** structured JSON stdout logs, viewed via `docker compose logs` piped through `jq` by a `just logs-pretty` target. OpenTelemetry SDK initialized with console exporter in dev; real exporter wired in deploy sub-project.
 
 **Branching:** trunk-based with short-lived feature branches; PR required for `main`; conventional commits encouraged, not required.
+
+#### 4.7.1 Remote access via Tailscale (profiles `remote` + `demo`)
+
+The default stack is local-only on `*.localtest.me`. When we want to reach CORPUS from another machine — or run a time-boxed demo for non-local viewers — we layer a Tailscale sidecar into the same Compose file via the `remote` profile. The host's existing Tailscale daemon and the prod Tailscale container are **not** touched.
+
+**Shape:**
+
+```yaml
+# docker-compose.yml  (excerpt — remote profile)
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    profiles: [remote, demo]
+    hostname: corpus-dev                 # becomes corpus-dev.<tailnet>.ts.net
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?set a one-time pre-auth key}
+      TS_AUTH_ONCE: "true"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_EXTRA_ARGS: "--advertise-tags=tag:corpus-dev"
+      # enables tailscale serve + funnel configuration via env:
+      TS_SERVE_CONFIG: /config/serve.json
+    volumes:
+      - tailscale_state:/var/lib/tailscale
+      - ./infra/tailscale:/config:ro
+    cap_add: [net_admin, sys_module]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    restart: unless-stopped
+
+  traefik:
+    profiles: [remote, demo]              # default profile uses "localtest" traefik instead
+    network_mode: "service:tailscale"    # shares tailscale's netns; only reachable at corpus-dev.<tailnet>.ts.net
+    # ... labels + config unchanged otherwise
+```
+
+**Access modes:**
+
+| Mode | Activation | Who reaches CORPUS | URL |
+|---|---|---|---|
+| Default (local only) | `docker compose up` | This host only | `http://corpus.localtest.me` |
+| Remote (tailnet private) | `docker compose --profile remote up` | Any device on the tailnet | `https://corpus-dev.<tailnet>.ts.net` |
+| Demo (public, time-boxed) | `docker compose --profile demo up` + `tailscale funnel 443 on` (run inside the sidecar) | Anyone on the public internet with the URL | Same `corpus-dev.<tailnet>.ts.net`, publicly resolvable with Tailscale-provided HTTPS |
+
+**Auth layering in the `demo` profile:** Traefik adds a Basic Auth middleware on the `/` and `/api` routers. Users file at `infra/traefik/usersfile` (bcrypt-hashed, gitignored; `.example` committed). Basic Auth is **in addition to** the app's dev-stub auth — belt + suspenders before Entra ID lands. When the Real Auth sub-project ships, Basic Auth becomes optional.
+
+**Isolation from prod and host:**
+
+- Own Tailscale identity (`corpus-dev`), own tailnet device, own ACL tag.
+- `network_mode: "service:tailscale"` means Traefik (and everything behind it) is only reachable on the `corpus-dev` tailnet IP — not on the host's public NIC, not on the host's tailnet IP, not on prod's tailnet IP.
+- Stopping the CORPUS stack cleanly removes the `corpus-dev` device from the tailnet.
+- Prod Traefik, prod Tailscale, and host Tailscale are untouched.
+
+**`.env` additions:**
+
+```
+TS_AUTHKEY=tskey-auth-...       # one-time, created in Tailscale admin console
+TS_HOSTNAME=corpus-dev
+BASIC_AUTH_USERS_FILE=./infra/traefik/usersfile  # used by demo profile only
+```
+
+**Data-residency note:** Funnel terminates TLS on the local Tailscale daemon (on *this* host), not at Tailscale's servers. Traffic does not pass through Tailscale's infrastructure at the application layer — consistent with the no-MITM posture we want for a regulator's stack. Tailscale's control plane sees only connection metadata (WireGuard is peer-to-peer).
 
 ---
 
@@ -894,6 +955,8 @@ Each decision records the *why*, so future-us can judge edge cases without re-li
 35. **Golden-file event renderer tests.** Why: subtle UI regressions on timeline are silent without them.
 36. **`static-web-server` (Rust) for prod frontend** (not nginx). Why: user preference for Traefik over nginx; static-web-server is tiny, has SPA fallback, no runtime ecosystem concerns.
 37. **`localtest.me` for dev hostnames.** Why: wildcard DNS to 127.0.0.1; no `/etc/hosts` edits.
+38. **Remote access via dedicated Tailscale sidecar in CORPUS Compose** (not shared host Tailscale, not shared production Traefik, not Cloudflare Tunnel). Why: host has both a host-level Tailscale daemon and a separate production Tailscale container already; reusing either would couple CORPUS to infra we must not disturb. A dedicated `corpus-dev` sidecar gives its own tailnet identity, its own `serve`/`funnel` rules, and a clean lifecycle (stopping CORPUS cleanly removes the device). Cloudflare Tunnel rejected because it would MITM all traffic at Cloudflare edge — problematic for a regulator's data-handling posture even in dev. Tailscale Funnel terminates TLS on the local daemon, no third-party visibility at application layer.
+39. **Basic Auth middleware active only in `demo` profile**, on top of the dev-stub auth. Why: the dev-stub auth (`X-Dev-User-Email` header) is trivially impersonable; when we expose the stack publicly via Funnel for a demo, Basic Auth provides a real access barrier. When Entra ID auth lands, Basic Auth becomes optional.
 
 ---
 
@@ -915,6 +978,8 @@ To resolve either before planning or during implementation. Each has a reasonabl
 12. **Demo / seed case content** — realistic enough to be useful; anonymized enough to be public? *Default: fictional "Example.com" complaint.*
 13. **`just` adoption** — primary interface or optional? *Default: optional; shell scripts in `/scripts/` mirror.*
 14. **Frontend lint tool** — ESLint + Prettier vs Biome? *Default: ESLint + Prettier (ubiquitous); revisit if Biome reaches critical mass.*
+15. **Basic Auth users file management** — committed `.example`, gitignored real; how do we bootstrap the first credential and rotate later? *Default: `htpasswd -B` generates a bcrypt line for `.env` to write into `infra/traefik/usersfile` at container start; rotation is a file replace + Traefik reload.*
+16. **Tailscale tailnet ACL for `tag:corpus-dev`** — what should it allow/deny? *Default: allow all enrolled devices in the tailnet; tighten when real data lands.*
 
 ---
 
