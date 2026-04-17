@@ -198,13 +198,13 @@ CORPUS runs as a small set of Compose services on a Linux host. Azure mapping is
 - **`Case`** — the complaint aggregate. `id`, `reference` unique (`CORPUS-2026-0042`), `title`, `description`, `category_id` FK, `status` enum `draft | open | closed`, `received_at`, `closed_at`, `created_by_user_id` (nullable), `is_escalated` bool, `escalation_level` enum `team_lead | council | leadership` (nullable), `escalated_at` (nullable), `escalated_by_user_id` (nullable), `escalation_reason` (nullable), `ai_disabled` bool default false (effective flag: true if explicitly set OR any complainant Party has `ai_opt_out=true`; computed+stored so the UI check is a single column read), `ai_disabled_reason` text nullable (`complainant_opt_out | staff_decision | policy | other`), `ai_disabled_at` nullable, `ai_disabled_by_user_id` nullable FK, timestamps.
 - **`CaseCategory`** — seeded taxonomy. `id`, `slug` (`dsa`, `ai-act`, `data-act`), `display_name`, `description`, timestamps.
 - **`CaseParticipant`** — party's role on a case. `id`, `case_id`, `party_id`, `role` enum `complainant | target | authority | cc | other`, `added_at`, `metadata` jsonb. Unique on `(case_id, party_id, role)`.
-- **`Event`** — append-only timeline. `id`, `case_id`, `sequence_number` (per-case monotonic bigint), `event_type` (dotted namespace), `actor_type` enum `user | system | party`, `actor_user_id` (nullable), `actor_party_id` (nullable), `via_ai_agent_id` (nullable FK AIAgent — set when a human action was AI-assisted), `from_interaction_id` (nullable FK AIInteraction — specific invocation that produced content the user used), `payload` jsonb, `occurred_at`, `recorded_at`. **No `UPDATE`/`DELETE` allowed.** The AI fields preserve the "human is always the actor" principle (§4.8) while making AI assistance auditable.
+- **`Event`** — append-only timeline. `id`, `case_id`, `sequence_number` (per-case monotonic bigint), `event_type` (dotted namespace), `schema_version` smallint NOT NULL default 1 (bumps when a payload shape changes; renderers dispatch on `(event_type, schema_version)`), `actor_type` enum `user | system | party`, `actor_user_id` (nullable), `actor_party_id` (nullable), `system_actor_ref` jsonb nullable (for `system` events: `{component, build_sha}` identifying which service/version emitted it), `request_ip` inet nullable, `user_agent` text nullable (populated on user-triggered events — read/download audit trail), `via_ai_agent_id` (nullable FK AIAgent — set when a human action was AI-assisted), `from_interaction_id` (nullable FK AIInteraction — specific invocation that produced content the user used), `payload` jsonb, `occurred_at`, `recorded_at`. **No `UPDATE`/`DELETE` allowed.** The AI fields preserve the "human is always the actor" principle (§4.8) while making AI assistance auditable.
 - **`Attachment`** — evidence. `id`, `case_id`, `event_id` (nullable), `original_filename`, `content_type` (sniffed, not trusted), `size_bytes`, `checksum_sha256`, `storage_key` (opaque UUID-based), `category_id` FK (NOT NULL, defaults to `other`), `is_internal` bool (never shareable externally when true), `uploaded_by_user_id`, `uploaded_by_party_id` (for future intake/email), `description`, `is_deleted` bool (soft delete), `deleted_at`, `deleted_by_user_id`, timestamps.
-- **`AttachmentCategory`** — admin-managed. `id`, `slug`, `display_name`, `description`, `is_system` (prevents deletion), `display_order`, timestamps. Seeded: `evidence`, `correspondence`, `contract`, `screenshot`, `internal_note`, `other`.
-- **`ProcessInstance`** — one process running on a case. `id`, `case_id`, `process_id`, `process_version`, `current_state`, `status` enum `running | completed | cancelled | error`, `kind` enum `main | spawned | triggered`, `parent_instance_id` (nullable, for sub-processes), `context` jsonb, `started_at`, `ended_at`, timestamps. **Partial unique index**: `(case_id) WHERE kind = 'main' AND status = 'running'` — one main per case. **Multiple concurrent instances are allowed** (main + spawned + triggered).
+- **`AttachmentCategory`** — admin-managed. `id`, `slug`, `display_name`, `description`, `is_system` (prevents deletion), `display_order`, `is_shareable_default` bool NOT NULL default true (when false, attachments of this category are excluded from future share bundles by default even if `is_internal=false` — safety rail for categories that are usually internal like `internal_note`), timestamps. Seeded: `evidence` (shareable), `correspondence` (shareable), `contract` (shareable), `screenshot` (shareable), `internal_note` (**not shareable** by default), `other` (shareable).
+- **`ProcessInstance`** — one process running on a case. `id`, `case_id`, `process_id`, `process_version`, **`process_definition_snapshot` jsonb NOT NULL** (the full compiled process definition as of instance creation — the engine executes against *this* snapshot, never the live file on disk; PRs that edit `processes/*.yaml` never break running instances), `current_state`, `status` enum `running | completed | cancelled | error`, `kind` enum `main | spawned | triggered`, `parent_instance_id` (nullable, for sub-processes), `context` jsonb, `started_at`, `ended_at`, timestamps. **Partial unique index**: `(case_id) WHERE kind = 'main' AND status = 'running'` — one main per case. **Multiple concurrent instances are allowed** (main + spawned + triggered).
 - **`Task`** — work item. `id`, `process_instance_id`, `case_id` (denormalized), `task_key`, `title`, `description`, `assigned_to_user_id` (nullable), `assigned_to_team_id` (nullable), `status` enum `open | claimed | completed | cancelled`, `outcome` (drives transitions), `data` jsonb (form data), `created_at`, `claimed_at`, `completed_at`, `completed_by_user_id`.
 - **`Template`** — correspondence text (text only v0; email subject field reserved). `id`, `slug`, `language` enum `nl | fr | en | de`, `subject` (nullable), `body` (Jinja2 placeholders; rendering via the `jinja2` package with an autoescaped, sandboxed environment), timestamps. Unique on `(slug, language)`.
-- **`AIAgent`** — a configured LLM endpoint that the AI Companion can invoke. `id`, `slug` (`summarizer`, `translator`, `analyst`…), `display_name`, `description`, `provider` enum `openai | anthropic | azure_openai | dummy`, `model` (e.g., `gpt-4o`, `claude-opus-4-7`), `endpoint` nullable (for Azure / proxy), `api_key_secret_ref` (**name** of the env var or Key Vault secret holding the key; the key itself is never in the DB), `default_prompt_prefix` nullable (system-style prefix for all invocations), `region` nullable (`eu` / `non-eu` — drives the PII warning UX), `is_active`, timestamps. See §4.8.
+- **`AIAgent`** — a configured LLM endpoint that the AI Companion can invoke. `id`, `slug` (`summarizer`, `translator`, `analyst`…), `display_name`, `description`, `provider` enum **`dummy` (v0)** | `openai` | `anthropic` | `azure_openai` (enum values exist, but **in v0 only `dummy` is accepted at agent creation**; the other providers + their `LLMClient` implementations land with §6.4 behind a DPO-sign-off gate), `model`, `endpoint` nullable, `api_key_secret_ref` (**name** of the env var or Key Vault secret; never the key itself), `default_prompt_prefix` nullable, `region` nullable (`eu` / `non-eu` — drives the PII warning UX), `is_active`, timestamps. See §4.8.
 - **`AIInteraction`** — append-only log of each AI Companion invocation. `id`, `case_id`, `user_id` (invoker), `agent_id` FK AIAgent, `prompt_slug` nullable (if a workflow-scoped or global prompt template was used), `prompt_version` (git rev of prompt at invocation), `interaction_kind` (`summarize | explain_attachment | draft_reply | chat | workflow_prompt`), `shared_input` jsonb (what was sent: included case fields, event ids, attachment ids — summarized, never raw), `input_hash` (sha256 of the assembled prompt), `prompt_rendered` text (the final prompt sent; internal-only), `output_text` text, `tokens_in`, `tokens_out`, `cost_estimate` nullable, `latency_ms`, `status` enum `ok | provider_error | rate_limited | cancelled`, `created_at`. See §4.8.
 
 **`ProcessDefinition` is NOT a DB table.** Process YAML files in `/processes/` are the authoritative source; loaded into an in-memory `ProcessRegistry` at app start. `ProcessInstance.process_id + process_version` pins each instance to a specific YAML.
@@ -222,7 +222,7 @@ CORPUS runs as a small set of Compose services on a Linux host. Azure mapping is
 - `ai_interactions(case_id, created_at DESC)` — case-scoped AI history, recent-first.
 - `ai_interactions(user_id, created_at DESC)` — per-user AI usage rollup for cost awareness.
 
-**Seed data on first boot (idempotent):** Teams (`complaint`, `dsa`, `ai`, `market`), case categories (`dsa`, `ai-act`, `data-act`), attachment categories, one dev user per team + one admin, Belgian region authorities (Flanders, Wallonia, Brussels), bare-bones NL/FR/EN templates for a minimal DSA flow, one demo case with a small timeline, **one `AIAgent` (`summarizer`) using the `dummy` provider** so the AI Companion is usable out of the box without API keys; `.env.example` documents `OPENAI_API_KEY=` / `ANTHROPIC_API_KEY=` placeholders for configuring real agents.
+**Seed data on first boot (idempotent):** Teams (`complaint`, `dsa`, `ai`, `market`), case categories (`dsa`, `ai-act`, `data-act`), attachment categories with `is_shareable_default` flags (see §4.2), one dev user per team + one admin, Belgian region authorities (Flanders, Wallonia, Brussels), bare-bones NL/FR/EN templates for a minimal DSA flow, one demo case with a small timeline, **one `AIAgent` (`summarizer`) using the `dummy` provider** so the AI Companion is usable out of the box. Real-provider keys (OpenAI/Anthropic/Azure OpenAI) come back in §6.4.
 
 ### 4.3 Workflow DSL
 
@@ -271,19 +271,19 @@ ai_prompts:                            # optional — AI Companion tools scoped 
 states: [ ... ]
 ```
 
-**State types:**
+**State types (v0 implements marked ✅; reserved types parse but raise `NotImplementedError` at instance-creation-time):**
 
-| Type | Role |
-|---|---|
-| `start` | Entry point. |
-| `task` | Produces a Task assigned to a user, team, or party. Completion drives transitions. |
-| `parallel` | Fan-out to N named branches; join policy (`all \| any \| threshold:N \| all_or_timeout`). |
-| `wait` | Suspended; awaits an external event matching a rule. |
-| `gateway` | Pure routing on context; no task. |
-| `sub_process` | Spawns another process on the same case; `mode: spawn_and_wait \| spawn_and_continue`; optional `pass_context`. |
-| `end` | Terminal; optionally sets `Case.status`. |
+| Type | v0 | Role |
+|---|---|---|
+| `start` | ✅ | Entry point. |
+| `task` | ✅ | Produces a Task assigned to a user, team, or party. Completion drives transitions. |
+| `parallel` | ✅ | Fan-out to N named branches. v0 join policies: `all`, `any`, `threshold:N`; `all_or_timeout` reserved until timers ship in §6.1. |
+| `sub_process` | ✅ | Spawns another process on the same case. v0 mode: `spawn_and_wait` only; `spawn_and_continue` reserved. `pass_context` supported. |
+| `end` | ✅ | Terminal; optionally sets `Case.status`. |
+| `gateway` | ❌ reserved | Pure routing on context. Not used in v0 scaffolds — `task` + `transitions` with `when` covers the pattern. Reserved for when a use case emerges. |
+| `wait` | ❌ reserved | Suspended, awaits external event. Covered in v0 by externally-satisfied `task` states (`completed_by: external_event`). Reserved. |
 
-Reserved for later: `timer`, `script`.
+Reserved for later sub-projects: `timer`, `script` (§6.1 / §6.4). `triggers.debounce` reserved (no v0 fixture needs it; fires with §6.2 email arrival cadence concerns).
 
 **Expression language: CEL** (Google's Common Expression Language, `celpy`). Safe, deterministic, typed, widely used (Kubernetes, GCP IAM). Variables: `task`, `context`, `case`, `event`, `now()`. Whitelisted functions only.
 
@@ -344,12 +344,17 @@ A participant task is completed by an external input event landing on the case (
 
 **Runtime semantics (dispatch loop):**
 
-1. Open transaction; acquire Postgres advisory lock on `hash(case_id)` (per-case serialization).
+1. Open transaction; acquire `pg_advisory_xact_lock(namespace=1 /* case_dispatch */, hashtextextended(case_id::text, 0))` — namespaced per concern so timers (namespace=2), triggers, etc. never collide with case-dispatch locks.
 2. Allocate `sequence_number = max + 1` for the case; insert the incoming event.
 3. **Trigger dispatch** — for every loaded process with a matching `triggers:` rule, evaluate `when`; spawn a new instance if satisfied.
-4. **Per-active-instance evaluation** — for each running instance on the case: evaluate current state's transitions against the new event/context; if a transition fires, emit paired `process.state_exited` / `process.state_entered`, run `on_enter` actions (which may queue more events in the same batch), update `current_state`.
-5. SLA evaluation (v0: parsed and validated only; firing in the timers sub-project).
+4. **Per-active-instance evaluation** — for each running instance on the case: execute against the instance's `process_definition_snapshot` (never the live file). Evaluate current state's transitions against the new event/context; if a transition fires, emit paired `process.state_exited` / `process.state_entered`, run `on_enter` actions (which **append to an in-tx deferred-event queue**, processed in order after the triggering event; max 256 deferred events per inbound event, cycle detector fires `ProcessLoopError` if the same `(instance_id, state_key)` transition fires twice in one batch).
+5. SLA evaluation (v0: parsed and validated only; firing in §6.1 timers sub-project).
 6. Commit transaction; release lock.
+
+**Bounds and guards:**
+- Max deferred events per dispatch: **256** (configurable, `ENGINE_MAX_DEFERRED_EVENTS`). Exceeding raises `ProcessLoopError`, rolls back the transaction, emits `process.error` event.
+- Cycle detector: tracks `(instance_id, state_key)` transitions within one dispatch batch; a repeat raises `ProcessLoopError`.
+- Process definition binding: the engine uses `ProcessInstance.process_definition_snapshot` for everything — transitions, `on_enter` actions, state type lookups, sub-process specs. The live `processes/*.yaml` file is the source for *new* instances only.
 
 **Validation at load time:** JSON Schema on file shape; CEL parse on every `when`; reachability analysis; no-dead-end check; assignment references (team slugs, party refs) resolve. A process failing validation is **not loaded**; admin UI surfaces it with the errors.
 
@@ -452,7 +457,7 @@ Accompanied by `/processes/forward_to_regions.yaml` (parallel Flanders/Wallonia/
 | `case.*` | `case.created`, `case.title_updated`, `case.description_updated`, `case.status_changed`, `case.closed`, `case.escalated`, `case.escalation_resolved` |
 | `participant.*` | `participant.added`, `participant.removed`, `participant.role_updated` |
 | `party.*` | `party.created`, `party.updated`, `party.anonymized` |
-| `attachment.*` | `attachment.added`, `attachment.downloaded`, `attachment.deleted`, `attachment.category_changed`, `attachment.visibility_changed` |
+| `attachment.*` | `attachment.added`, `attachment.downloaded`, `attachment.deleted`, `attachment.category_changed`, `attachment.visibility_changed`, `attachment.content_verified` (sha256 re-verify on download matched stored checksum), `attachment.content_mismatch` (sha256 re-verify failed — evidence integrity alert) |
 | `process.*` | `process.started`, `process.state_entered`, `process.state_exited`, `process.ended`, `process.error` |
 | `task.*` | `task.created`, `task.claimed`, `task.completed`, `task.cancelled`, `task.reassigned` |
 | `external.*` | `external.info_received`, `external.reply`, `external.forward_sent` |
@@ -475,7 +480,7 @@ Each type has a JSON Schema validator in `backend/src/corpus/events/schemas/`. U
 
 **Concurrency model:**
 
-- Single writer per case via Postgres advisory lock on `hash(case_id)`.
+- Single writer per case via `pg_advisory_xact_lock(namespace=1, hashtextextended(case_id::text, 0))` — namespace=1 reserved for case-dispatch; other concerns (timers=2, future triggers subsystem=3, etc.) use distinct namespaces so lock domains never collide. Documented in `backend/src/corpus/core/locking.py`.
 - Multiple readers; no lock on reads.
 - Idempotency: external event schemas declare idempotency keys where applicable; v0 staff-entered externals get a UUID.
 
@@ -521,7 +526,7 @@ Route-level authz via composable dependencies: `require_admin`, `require_team_me
 - `POST /api/cases/{id}/attachments` — multipart upload.
 - `GET /api/cases/{id}/attachments` — list with filters (category, is_internal, event_id).
 - `GET /api/cases/{id}/attachments/{id}` — metadata.
-- `GET /api/cases/{id}/attachments/{id}/download` — streamed.
+- `GET /api/cases/{id}/attachments/{id}/download` — streamed binary. **Re-computes sha256 during streaming**; on match emits `attachment.downloaded` + `attachment.content_verified`; on mismatch emits `attachment.content_mismatch`, surfaces in `/api/admin/health`, rejects the download with 500. Event payload carries `request_ip` + `user_agent` for audit.
 - `PATCH /api/cases/{id}/attachments/{id}` — metadata edits.
 - `DELETE /api/cases/{id}/attachments/{id}` — soft delete with `reason`.
 
@@ -547,11 +552,13 @@ Route-level authz via composable dependencies: `require_admin`, `require_team_me
 **Templates**
 - `GET /api/templates`, `POST /api/templates/{slug}:render`.
 
-**Admin / support**
-- `GET /api/admin/health`.
-- CRUD: `/api/admin/categories/cases`, `/api/admin/categories/attachments`.
+**Admin / support** *(v0 scope narrowed per decision C2-mixed — deferred items land in a later admin-polish sub-project or §6.4)*
+- `GET /api/admin/health` — DB, process-registry, and evidence-integrity status (any `attachment.content_mismatch` alerts).
+- CRUD: `/api/admin/categories/attachments` (v0 — explicitly requested).
+- `GET /api/admin/categories/cases` (read-only v0; CRUD deferred — new case categories arrive via seed/migration).
 - `GET /api/teams`, `GET /api/users` (read-only v0).
 - `GET /api/me`.
+- **Deferred from v0 admin surface** (land with §6.4 / admin-polish): `POST/PATCH /api/admin/categories/cases`, `POST/PATCH /api/admin/ai-agents`, `GET /api/admin/ai-usage`.
 
 **Dashboard**
 - `GET /api/dashboard/complaint-team` — aggregated widget data in one response (filters: category, date_range). Complaint Team / admin only.
@@ -565,8 +572,8 @@ Route-level authz via composable dependencies: `require_admin`, `require_team_me
 - `POST /api/cases/{id}:disable-ai` — body `{reason}`. Complaint Team or admin. Sets `ai_disabled=true`. Emits `case.ai_disabled`.
 - `POST /api/cases/{id}:enable-ai` — body `{reason}`. **Admin only** (re-enabling after opt-out requires oversight). Emits `case.ai_enabled`. Refuses if any complainant Party on the case has `ai_opt_out=true` unless the Party's opt-out is cleared first.
 - `PATCH /api/parties/{id}` — already supports `ai_opt_out` toggle. When flipped on a complainant Party, **all cases the party is on are automatically marked `ai_disabled=true`** (transactionally, emits `case.ai_disabled` per case). When cleared, disabled cases are **not** automatically re-enabled — staff must explicitly call `:enable-ai` per case, forcing a human decision.
-- `GET /api/admin/ai-agents`, `POST /api/admin/ai-agents`, `PATCH /api/admin/ai-agents/{id}` — CRUD (admin). Emits `admin.ai_agent_*` events.
-- `GET /api/admin/ai-usage?from=&to=&by=user|agent` — rollups for cost awareness. Admin only.
+- `GET /api/admin/ai-agents` — read-only listing. **v0 ships only the seeded `dummy` agent**; `POST`/`PATCH` and agent CRUD UI ship with §6.4 behind the DPO-approval gate for real providers.
+- Usage rollups (`/api/admin/ai-usage`) **deferred to §6.4** — meaningless under dummy-only A3.
 
 **Error shape (RFC 7807, single envelope everywhere):**
 
@@ -610,17 +617,18 @@ Simple, testable, generalizable when the RBAC sub-project lands.
 | `/tasks`, `/tasks/:id` | all | Inbox + task detail with dynamic form. |
 | `/parties`, `/parties/:id` | all | Directory + detail. |
 | `/processes`, `/processes/:id/:version` | all | Loaded processes + validation status. |
-| `/admin/categories/cases`, `/admin/categories/attachments` | admin | CRUD. |
+| `/admin/categories/attachments` | admin | CRUD (v0 — explicitly requested). |
+| `/admin/categories/cases` | admin | **Read-only v0** — CRUD deferred; new categories via migration. |
 | `/admin/teams`, `/admin/users` | admin | Read-only v0. |
-| `/admin/ai-agents` | admin | CRUD for configured AI agents — provider, model, endpoint, secret ref, region, prompt prefix. Emits `admin.ai_agent_*` events. |
-| `/admin/ai-usage` | admin | Per-user / per-agent / per-day rollups of interactions, tokens, estimated cost. |
+| `/admin/ai-agents` | admin | **Read-only v0** (shows the seeded dummy agent); CRUD ships with §6.4. |
+| `/admin/ai-usage` | admin | **Deferred to §6.4** — meaningless under dummy-only A3. |
 
 #### 4.6.3 Complaint Team dashboard widgets
 
 - **Portfolio overview** — cards per category (DSA, AI Act, Data Act, …) with counts: Open, Stalled, At risk, Breached, Closed this month.
 - **Escalations** — currently escalated cases with level, reason, days open.
-- **Stalled cases** — top N by "days since last event" across all categories.
-- **Upcoming deadlines** — placeholder in v0, wired when timers ship.
+- **Stalled cases** — top N by "days since last event" across all categories. **v0 fixed 14-day threshold**; per-category config lands with §6.1 Timers.
+- **Upcoming deadlines** — **cut from v0** — placeholder without SLA firing; widget lights up when §6.1 Timers ships.
 - **Recent activity** — last 20 events across all cases, grouped by case.
 - **My tasks / My team's queue** — personal inbox.
 
@@ -714,11 +722,11 @@ open http://traefik.localtest.me:8080
 
 **Seed data:** `backend/scripts/seed.py`, idempotent, detects empty `teams` table and runs. Re-runnable with `just seed` after `just reset-db`.
 
-**CI (GitHub Actions, one workflow `ci.yml`):** lint + typecheck (parallel) → backend tests (spins up Postgres service) → frontend unit → e2e (Compose up with e2e profile) → build images (artifacts; no push yet) → axe snapshots.
+**CI (GitHub Actions, one workflow `ci.yml`):** lint + typecheck (parallel) → backend tests (spins up Postgres service) → frontend unit → **OpenAPI-spec drift check** (fails if `just codegen` produces diff) → **`pip-audit` + `npm audit`** (non-blocking warnings unless CVE severity ≥ high) → e2e (Compose up with e2e profile) → **axe-playwright accessibility snapshots on key pages (case detail, dashboard, task detail)** → build images (artifacts; no push yet).
 
 **Container image strategy:** multi-stage Dockerfiles for both. Backend: base (python:3.12-slim) → deps (`uv sync`) → runtime. Frontend: deps (pnpm) → build (vite) → runtime (static-web-server with `dist/`). Non-root containers.
 
-**Pre-commit:** ruff, mypy (staged), eslint + prettier (staged), check-large-files, no-commit-to-main, `openapi-spec-drift` (fails if codegen output has unstaged diffs), `gitleaks`, `pip-audit` / `npm audit` (baseline security).
+**Pre-commit (fast, local, deterministic):** ruff, mypy (staged), eslint + prettier (staged; ESLint config includes a rule flagging hardcoded strings in JSX to neutralize i18next drift), check-large-files, no-commit-to-main, `gitleaks`. *(Moved to CI per decision C4-trim-network: `openapi-spec-drift`, `pip-audit`, `npm audit` — network-dependent or drift-prone checks run on PR, not locally.)*
 
 **Secrets & config:** `.env` in dev (gitignored), `.env.example` is source-of-truth; pre-commit asserts every `os.getenv` reference has a documented entry. GitHub Secrets in CI. Azure Key Vault references in future deploy sub-project.
 
@@ -877,17 +885,11 @@ Validation at process-load time: each `ai_prompts` entry has unique slug within 
 #### 4.8.6 Configuration (`.env` additions)
 
 ```
-# Per-user invocation soft limit (dev default)
+# Per-user invocation soft limit
 AI_RATE_LIMIT_PER_USER_PER_HOUR=60
-
-# Personal testing keys (optional; agents pick these up by secret_ref)
-OPENAI_API_KEY=
-ANTHROPIC_API_KEY=
-AZURE_OPENAI_API_KEY=
-AZURE_OPENAI_ENDPOINT=
 ```
 
-Admins create agents by configuring `AIAgent.api_key_secret_ref` to one of these env names (or a Key Vault secret name in prod). The key value itself is read from env at invocation time — never stored in the DB.
+**v0 ships dummy-only** (decision A3). `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `AZURE_OPENAI_*` env vars and their corresponding `LLMClient` implementations land in §6.4 behind a DPO-approval gate: DPA with provider, per-agent redaction profile, lawful-basis documentation, `party.anonymized` → redaction hook for `AIInteraction.prompt_rendered`/`output_text`, and a boot-time assertion banning non-EU providers outside `CORPUS_ENV=dev`. The `AIAgent.api_key_secret_ref` field stays in the schema for forward compatibility but is unused in v0 (dummy needs no key).
 
 ---
 
@@ -918,10 +920,11 @@ Each fixture gets dedicated scenario tests. New primitives land as a new fixture
 **DB invariant tests** (real Postgres):
 
 - `UPDATE events` / `DELETE events` rejected by privileges.
-- Per-case monotonic gapless `sequence_number` under concurrent writers.
+- **One deterministic 2-worker concurrency test** (decision D2-minimal): two workers hit one case simultaneously via `threading.Barrier`; assert `sequence_number` ends contiguous and both events land in-order. Not a stress/fuzz test — a single functional correctness assertion for the advisory-lock cornerstone.
 - Every business-layer mutation pairs with exactly one event of the expected type.
 - Soft-deleted attachments hidden from default list, present in timeline.
-- Partial unique on `process_instances` (main running) holds under concurrent double-start.
+- Partial unique on `process_instances` (main running) holds under a concurrent double-start attempt (one wins, the other gets a constraint-violation error).
+- Attachment `content_mismatch` path: a storage byte-flip triggers `attachment.content_mismatch` event + rejects the download.
 
 **Process YAML validation tests:** parametrized walk over `/processes/` + fixtures; asserts zero errors on valid, specific errors on invalid.
 
@@ -933,16 +936,9 @@ Each fixture gets dedicated scenario tests. New primitives land as a new fixture
 
 **Migration tests:** `alembic upgrade head` on fresh DB in CI; `alembic check` asserts no pending autogenerate.
 
-**Performance budgets (soft, regression guards at ~10k seeded cases):**
+**Performance budgets — deferred from v0 CI** (decision D1-defer).
 
-| Endpoint | Target p95 |
-|---|---|
-| `GET /api/cases` (default filter) | < 200ms |
-| `GET /api/cases/{id}` | < 150ms |
-| `GET /api/cases/{id}/events` (first page) | < 200ms |
-| `POST /api/cases/{id}/external-events` incl. dispatch | < 300ms |
-
-Measured via `just bench`; fails CI if 2× over budget.
+At 100s/year, a 10k-case perf budget is ~100 years of data and the problems it would catch (N+1, missing indexes) surface long before 10k cases to any human using the UI. The seed-to-10k script stays in the repo; `just bench` runs it manually before each v0.x release as a sanity check. Full perf-testing infrastructure lands with the real-data sub-project after Foundations is in real use.
 
 **Testing culture:** *Tests that run in CI are a spec written in code — if a behavior matters, there's a test that fails when it breaks.*
 
@@ -950,28 +946,29 @@ Measured via `just bench`; fails CI if 2× over budget.
 
 ## 6. Deferred / future sub-projects
 
-Each entry below is a candidate for its own brainstorm → spec → plan cycle. The order in parentheses is a recommended sequencing under the "Option B — platform from day one" phasing we selected.
+Each entry below is a candidate for its own brainstorm → spec → plan cycle. **Recommended phasing** under Option B (platform-first): Timers first, then Email I/O, then Public Intake, then AI Triage, then Share Bundles, etc. SLAs are a non-negotiable regulator obligation — they are set at the EU level, not internal targets — which is why §6.1 is Timers, not Public Intake.
 
-### 6.1 Public Intake Form (recommended next — after Foundations)
+### 6.1 Timers & SLAs **(recommended next after Foundations — mandatory)**
 
-- **What:** multilingual public form (NL/FR/EN, DE later) for citizens/businesses to submit complaints; file upload; GDPR consent; captcha / anti-spam; accessibility (AnySurfer).
-- **Depends on:** Foundations; probably Email I/O (for acknowledgement).
-- **V0 hooks already in place:** `Case`, `Party`, `Attachment` entities; language per party; storage abstraction; external-events endpoint pattern; i18next framework.
-- **Key open questions:** anonymous vs email-verified vs eID/itsme; captcha choice (hCaptcha EU? Cloudflare Turnstile?); file type / size limits for public uploads; rate limiting; legal copy approval; public-URL strategy.
-
-### 6.2 Email I/O (recommended second)
-
-- **What:** inbound mailbox parsing (new complaints, replies threaded to existing cases) and outbound sending (acks, info requests, reminders, forwards). Probably Exchange Online via Microsoft Graph API given BIPT's Microsoft-shop context.
+- **Why first:** CORPUS's obligations include EU-mandated deadlines (DSA acknowledgement windows, response-to-complainant timelines, Article-21-type review SLAs, regional-authority response clocks). These are externally-set regulator obligations, not internal targets. The platform's job is to track them reliably, surface breaches clearly, and generate the auditable record that BIPT can defend to the Council and to EU bodies. Everything else (Email I/O, Public Intake, AI Triage) depends on or is qualified by this.
+- **What:** actual timer firing (durable scheduler); SLA breach detection + `notify_team` / `send_reminder` / `escalate` side-effects on breach; `all_or_timeout` join policy; per-branch SLAs on parallel fan-out; the `Upcoming deadlines` dashboard widget lighting up; `Stalled cases` widget becoming per-category configurable; `start_timer` / `cancel_timer` DSL actions implemented; `on_timeout` hook firing.
 - **Depends on:** Foundations.
+- **V0 hooks in place:** `slas:` block parsed and validated in DSL; `start_timer`/`cancel_timer`/`on_timeout` reserved action vocabulary; `slas:` stored on process definitions; `case.ai_disabled` / escalation lifecycle.
+- **Key open questions:** durable scheduler choice (Celery+Redis? `pg_boss` via asyncpg? Postgres-backed custom using `LISTEN/NOTIFY` + advisory locks?); timezone handling (UTC in DB, render local); business-day vs calendar-day SLAs per-category; reminder-cadence defaults; what should happen on engine downtime during a scheduled firing (catch-up vs skip).
+
+### 6.2 Email I/O (recommended second — naturally pairs with Timers)
+
+- **What:** inbound mailbox parsing (new complaints, replies threaded to existing cases) and outbound sending (acks, info requests, reminders that §6.1 schedules, forwards). Probably Exchange Online via Microsoft Graph API given BIPT's Microsoft-shop context.
+- **Depends on:** Foundations; timers (for reminder dispatch).
 - **V0 hooks:** Template entity; `reminder.sent` and `external.*` events; `Attachment.event_id`; `external-events` endpoint as shared client.
 - **Key open questions:** Graph vs IMAP; thread-matching strategy (`References`/`In-Reply-To` vs reference-in-subject); bounce handling; DKIM/SPF setup; legal archive retention; opt-in to store full raw emails as `.eml` attachments for evidence.
 
-### 6.3 Timers & SLAs (recommended alongside Email I/O)
+### 6.3 Public Intake Form (recommended third)
 
-- **What:** actual timer firing; SLA breach detection + notify/remind/escalate side-effects; `all_or_timeout` join policy; reminder scheduling.
-- **Depends on:** Foundations; likely Email I/O (so reminders actually send).
-- **V0 hooks:** SLA shape parsed and validated in DSL; `start_timer`/`cancel_timer`/`on_timeout` reserved action vocabulary; `slas:` blocks loaded and stored.
-- **Key open questions:** durable scheduler choice (Celery+Redis? pg_boss? Postgres-backed custom?); timezone handling (UTC in DB, render local); business-day vs calendar-day SLAs (per-category?); reminder-cadence defaults; what should happen on engine downtime during a scheduled firing.
+- **What:** multilingual public form (NL/FR/EN, DE later) for citizens/businesses to submit complaints; file upload; GDPR consent; **explicit AI-processing opt-out checkbox** (maps to `Party.ai_opt_out`); captcha / anti-spam; accessibility (AnySurfer).
+- **Depends on:** Foundations; Email I/O (for acknowledgement email).
+- **V0 hooks already in place:** `Case`, `Party`, `Attachment` entities; language per party; storage abstraction; external-events endpoint pattern; i18next framework; `Party.ai_opt_out` + `ai_opt_out_source` fields.
+- **Key open questions:** anonymous vs email-verified vs eID/itsme; captcha choice (hCaptcha EU? Cloudflare Turnstile?); file type / size limits for public uploads; rate limiting; legal copy approval; public-URL strategy.
 
 ### 6.4 AI as workflow actor (proposal + review)
 
@@ -1110,6 +1107,30 @@ Each decision records the *why*, so future-us can judge edge cases without re-li
 
 ---
 
+**Critic-informed amendments (after three-agent independent review):**
+
+46. **v0 ships only the `dummy` LLM client** (decision A3). Real-provider clients (OpenAI/Anthropic/Azure OpenAI) move to §6.4 behind a DPO-approval gate requiring DPA with provider, per-agent redaction profile, lawful-basis documentation, and a `party.anonymized` → `AIInteraction` redaction hook. Why: Security critic flagged that personal OpenAI/Anthropic keys in a regulator stack route complainant data to US processors with no DPA, no redaction, and no retention control — not DPIA-ready. Locking to dummy in v0 preserves the AI-first-class UX without the compliance hazard.
+47. **Process definition snapshots on `ProcessInstance`.** Why: YAML files in git are authoritative, but running instances must execute against a frozen JSON snapshot captured at instance-creation. PRs editing `processes/*.yaml` never break in-flight cases; migration of existing instances becomes an explicit decision. Architecture critic flagged this as a day-1 concern, not a §6.14 "need a policy" item.
+48. **Dispatch-loop bounds + cycle detection.** Why: the engine's "actions may queue more events in the same batch" language was under-specified. v0 implements a deferred-event queue with `ENGINE_MAX_DEFERRED_EVENTS=256` and a `(instance_id, state_key)` cycle detector raising `ProcessLoopError` on repeats. Architecture critic flagged unbounded recursion risk.
+49. **`Event.schema_version` column** + renderer dispatch on `(event_type, schema_version)`. Why: event payloads will evolve; without a version column, old events render incorrectly after a renderer change and the "deterministic replay" invariant is silently broken. Cheap now, impossible to retrofit at 50k events.
+50. **Auth-backend refuse-to-boot guard.** Why: the dev stub (`X-Dev-User-Email`) is trivially impersonable; nothing in the spec prevented its accidental deployment in staging/prod. v0 adds a startup assertion: `AUTH_BACKEND=dev` only permitted when `CORPUS_ENV ∈ {dev, test}`; Basic Auth mandatory when stub is active and not bound to loopback.
+51. **Evidence integrity hardening.** Why: SHA-256 was computed on upload but never re-verified on download; system-actor events were unattributed; downloads weren't logged with IP/user-agent. v0 adds: SHA-256 re-verify on every download (emits `attachment.content_verified` / `content_mismatch`); `Event.system_actor_ref` captures `{component, build_sha}`; `Event.request_ip` + `Event.user_agent` on user events.
+52. **Share-bundle exclusion flags on v0 categories and events.** Why: Security critic flagged that when §6.5 ships, a staff mistake could forward `internal_note` attachments or AI interaction content to external authorities. v0 adds `AttachmentCategory.is_shareable_default` (defaulting `internal_note` to false) and flags `AIInteraction` + `ai.*` events as `excluded_from_share_bundle` at schema level.
+53. **Namespaced advisory locks.** Why: `pg_advisory_xact_lock(namespace=1, hash)` with reserved namespaces per concern (case-dispatch=1, timers=2, future triggers=3) prevents cross-concern deadlocks once other subsystems acquire their own advisory locks. Cheap and future-proof.
+54. **DSL primitive restraint (B-moderate).** Why: `gateway`, `wait`, `spawn_and_continue`, `debounce` aren't exercised by v0 scaffolds. v0 validator parses them but `NotImplementedError` at instance-creation, pointing to the sub-project that will implement them. Non-`all` join policies kept (cheap enough) — preserves platform-first signal without dead-code tax.
+55. **i18next wired day-one with ESLint-rule enforcement.** Why: retrofit cost when NL lands is far higher than day-one wire-up. ESLint rule flagging hardcoded JSX strings neutralizes the drift-surface concern Pragmatist raised.
+56. **Admin UI scope trimmed (C2-mixed).** Why: under A3, AI agent CRUD and AI usage rollups have near-zero v0 value. Case-category CRUD is rarely exercised. v0 keeps: attachment-category CRUD (you asked for it), read-only teams/users/AI-agents/case-categories. Defers CRUD on the rest to a later admin-polish sub-project.
+57. **§6.1 is Timers, not Public Intake.** Why: SLAs are EU-mandated regulator obligations, not internal targets; the platform's core value proposition is reliable deadline tracking. Timers lands first after Foundations so the regulatory SLA loop closes as soon as possible.
+58. **Dashboard widget trimmed: 6 → 5** (drop `Upcoming deadlines` placeholder; keep `Stalled cases` with fixed 14-day default). Why: placeholder widget until §6.1 delivers real value; fixed default keeps `Stalled` useful now without requiring the per-category config decision to be made pre-emptively.
+59. **Pre-commit trimmed to fast + local + deterministic hooks** (C4-trim-network). Why: `openapi-spec-drift`, `pip-audit`, `npm audit` are network-dependent or drift-prone; pre-commit should be fast; CI is the gate. Keeps protection, cuts Friday-evening pain.
+60. **Tailscale `remote` + `demo` profiles both kept** (C5-keep-all). Why: user explicitly asked for remote access; `demo` profile is thin incremental cost on top of `remote`; deferring either means re-designing under time pressure later.
+61. **Golden-file event renderer tests kept** (C6-keep). Why: `.txt` string-output snapshots of tiny pure functions are not DOM-snapshot-brittle; they catch silent timeline rendering regressions that manual review will miss; cheap to maintain.
+62. **10k-case CI perf budget dropped** (D1-defer). Why: at 100s/year scale, the budget doesn't meaningfully protect. Manual pre-release benchmark via `just bench` covers the sanity check.
+63. **Single deterministic 2-worker concurrency test** (D2-minimal). Why: the advisory lock is too central to go untested; a `threading.Barrier`-synchronized 2-worker assertion is much cheaper to maintain than an N-worker stress fuzzer.
+64. **Axe-playwright snapshots in CI on 3 pages** (D3-keep). Why: WCAG 2.1 AA / AnySurfer is a Belgian federal-body obligation, not best-effort. Automating the ~30-40% that's automatable is cheap protection; manual screen-reader pass still required for the rest.
+
+---
+
 ## 8. Open questions
 
 To resolve either before planning or during implementation. Each has a reasonable default.
@@ -1135,6 +1156,10 @@ To resolve either before planning or during implementation. Each has a reasonabl
 19. **Complainant AI-opt-out policy, formally** — platform default now says opt-out is respected case-wide; does BIPT Council want to (a) endorse as-is, (b) require explicit opt-*in* instead (AI off by default), or (c) restrict opt-out to specific categories? *Default: opt-out respected; opt-in flip is a config toggle we can add if the Council wants.*
 20. **Clearing a complainant opt-out** — who is allowed, and what evidence is required? *Default: admin role; staff records a `reason` text; the expected justification is "written confirmation from complainant"; no automatic re-enable of case-level AI.*
 21. **Workflow-scoped prompt governance** — since `ai_prompts` live in YAML, do Complaint Team authors get direct edit access to workflows, or do they propose via PR? *Default: PR-style via git for v0; the later designer UI will formalize an in-app propose-and-approve flow.*
+22. **`ENGINE_MAX_DEFERRED_EVENTS` threshold** — 256 seems generous for a per-inbound-event budget; revisit once we see real workflow depth. *Default: 256.*
+23. **Event schema migration strategy when `schema_version` bumps** — do we provide upcaster functions in code, or explicit per-version renderers? *Default: per-version renderers; upcasters only added when two payload shapes must coexist across a real migration window.*
+24. **BIPT Council opt-out policy ratification** — Geoffrey is proposing the default; Council may adjust to opt-in-only, or restrict opt-out to specific categories. *Default: opt-out respected; toggle is configurable so the default flips without code change if ratification diverges.*
+25. **How to seed the first AI agent in §6.4** — when real providers land, which one first (Azure OpenAI in Belgium Central, an EU-hosted open-source model via a self-run endpoint, or Anthropic)? *Default: Azure OpenAI Belgium Central first — best DPA + residency + model quality story; revisit if Belgium region lags model availability.*
 
 ---
 
