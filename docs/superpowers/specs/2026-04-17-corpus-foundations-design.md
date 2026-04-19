@@ -1,8 +1,10 @@
 # CORPUS — Foundations Design Spec
 
-**Status:** Draft for review
-**Date:** 2026-04-17
-**Scope:** First sub-project (Foundations + Case & Attachment domain + Event Timeline + Workflow Engine Skeleton + Staff UI v0) of the larger CORPUS platform.
+**Status:** Draft for review — ready for implementation planning
+**Created:** 2026-04-17
+**Last amended:** 2026-04-19 (three-critic review feedback folded in; §6 re-prioritized so Timers & SLAs is the next sub-project after Foundations)
+**Scope (v0, this spec):** Foundations + Case, Party, Attachment & Event Timeline + Workflow Engine Skeleton (state machine, parallel/sub_process/triggers runtime, SLAs parsed but not fired) + Staff UI (dashboard, case detail tabs, AI Companion drawer) + AI Companion (v0 dummy-only LLM client) + remote access via Tailscale sidecar. Runs on Docker Compose locally; Azure deploy is its own later sub-project.
+**Next sub-project (recommended):** §6.1 Timers & SLAs — actual timer firing, reminder automation, breach-triggered escalation. Elevated from former §6.3 position because EU-mandated SLAs are non-negotiable regulator obligations, not internal targets.
 **Author:** Geoffrey Richard (with Claude)
 
 ---
@@ -35,9 +37,13 @@
 
 CORPUS is a **configurable workflow platform**, not a hardcoded complaint CRM. The Complaint Team authors processes (initially as reviewed YAML in git, later via a no-code designer); the engine runs them; every state change is captured in an append-only event timeline. AI-assisted triage, multilingual correspondence, bidirectional email, external forwarding with share bundles, and dashboards for oversight are all first-class features planned across the roadmap.
 
-**This first sub-project (the subject of this spec) establishes the Foundations:** domain model, append-only event timeline, attachment handling with evidence-integrity guarantees, the workflow engine skeleton (states, transitions, parallel fan-out/fan-in, sub-processes, triggered processes, SLA declarations parsed but not fired), and a staff UI that lets humans create cases, upload attachments, advance processes, send reminders, and escalate — running locally on Docker Compose with a clean path to Azure Container Apps later.
+**This first sub-project (the subject of this spec) establishes the Foundations:** domain model (including AI companion entities and complainant AI-opt-out), append-only event timeline with `schema_version` and evidence-integrity guarantees (SHA-256 re-verify on download, system-actor attribution, request-IP logging), attachment handling with soft-delete and share-bundle exclusion flags, the workflow engine skeleton (start/task/parallel/sub_process/end state types + triggers; `gateway`/`wait`/`spawn_and_continue`/`debounce` reserved; SLAs declared but not fired), the **AI Companion** (drawer UI, workflow-scoped prompts, opt-out enforcement — v0 ships only the `dummy` LLM client, real providers land in §6.4 behind a DPO gate), and a staff UI (tabbed case detail, Complaint-Team dashboard with 5 widgets, escalate + send-reminder actions). Runs locally on Docker Compose with an isolated Tailscale sidecar for remote dev access.
 
-**Explicit non-goals for v0:** public intake form, email I/O, AI triage, timer/SLA firing, external share-bundle dispatch, workflow designer UI, real Entra ID authentication, reporting & analytics dashboards, Azure deployment. Each is its own future sub-project (see §6) with the v0 hooks already in place.
+**Next sub-project after Foundations: §6.1 Timers & SLAs** — the regulatory deadline loop (external EU-set SLAs, automatic reminders, breach-triggered escalations). Elevated to first position in the roadmap because SLA compliance is a core regulator obligation.
+
+**Explicit non-goals for v0:** public intake form, email I/O, AI-as-workflow-actor (proposals + review flow), real LLM provider clients (OpenAI/Anthropic/Azure OpenAI — behind DPO gate in §6.4), timer/SLA firing, external share-bundle dispatch, workflow designer UI, real Entra ID authentication, reporting & analytics dashboards, Azure deployment. Each is its own future sub-project (see §6) with v0 hooks already in place.
+
+**Post three-critic review (architecture / security / pragmatism):** the spec was amended on 2026-04-19 to lock in 19 additional decisions (cheap architectural hardening, security guardrails, DSL primitive restraint, scope trims, testing trims) driven by critic feedback. See decisions §7 #46–64 for the full list and rationale.
 
 ---
 
