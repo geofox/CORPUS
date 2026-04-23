@@ -1,0 +1,8 @@
+- [User profile](user_profile.md) — Geoffrey at BIPT, building CORPUS
+- [Project: CORPUS overview](project_corpus.md) — complaint management platform for BIPT; current state
+- [Feedback: Traefik over nginx](feedback_traefik.md) — validated preference for edge proxy in dev/prod
+- [Feedback: Local-first Compose dev](feedback_local_first.md) — Docker Compose before cloud, deploy as later spec
+- [Feedback: Isolate from prod infra](feedback_infra_isolation.md) — never reuse prod Traefik/Tailscale/etc; always ship CORPUS-owned instances
+- [Feedback: AI consent-first](feedback_ai_consent_first.md) — AI is a companion (no autonomous action); complainants may opt out of AI processing
+- [Feedback: Comprehensive specs](feedback_spec_structure.md) — specs must include deferred + decisions log + open questions
+- [Reference: CORPUS spec doc](reference_spec.md) — path to the foundations design spec

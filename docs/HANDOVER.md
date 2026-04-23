@@ -22,7 +22,7 @@ Before you do anything else:
 
 1. Read this document completely.
 2. Read the **authoritative spec** at `docs/superpowers/specs/2026-04-17-corpus-foundations-design.md`. It is 1443 lines; it is the single source of truth for design decisions.
-3. Read the **user-scoped memory** at `/home/geoffrey/.claude/projects/-home-geoffrey-CORPUS/memory/` — especially `MEMORY.md`, `user_profile.md`, `project_corpus.md`, and the `feedback_*.md` files.
+3. Read the **memory files** — a committed snapshot lives at `docs/memory/` (in this repo) and the live copy (if you're on the original author's machine) is at `/home/geoffrey/.claude/projects/-home-geoffrey-CORPUS/memory/`. Start with `MEMORY.md`, `user_profile.md`, `project_corpus.md`, and the `feedback_*.md` files.
 4. Check the git log (`git log --oneline`) — you should see six commits all starting with `docs:`. Nothing else.
 
 Only after those four steps should you respond to any user request substantively.
@@ -269,9 +269,12 @@ Currently empty. Planned monorepo layout (from spec §4.1):
 
 ## 10. Memory system
 
-Path: **`/home/geoffrey/.claude/projects/-home-geoffrey-CORPUS/memory/`**
+**Committed snapshot:** `docs/memory/` (in this repo — the preferred entry point for successors).
+**Live canonical copy** (on the original author's machine only): `/home/geoffrey/.claude/projects/-home-geoffrey-CORPUS/memory/`.
 
-This is project-scoped persistent memory across Claude sessions. When you start, read `MEMORY.md` — it's an index. The files:
+Keep them in sync when material facts change — update `~/.claude/.../memory/` as you normally would, then copy modified files into `docs/memory/` and commit. `docs/memory/README.md` explains the dual-location convention.
+
+When you start, read `MEMORY.md` — it's an index. The files:
 
 - `MEMORY.md` — index, always loaded into context. Keep it short (≤200 lines).
 - `user_profile.md` — Geoffrey's role, preferences, collaboration style.
@@ -544,7 +547,8 @@ Do **not**:
 |---|---|
 | Working dir | `/home/geoffrey/CORPUS` |
 | Spec path | `docs/superpowers/specs/2026-04-17-corpus-foundations-design.md` |
-| Memory dir | `/home/geoffrey/.claude/projects/-home-geoffrey-CORPUS/memory/` |
+| Memory (committed) | `docs/memory/` (authoritative for successors) |
+| Memory (live) | `/home/geoffrey/.claude/projects/-home-geoffrey-CORPUS/memory/` (author's machine only) |
 | Git remote | `git@github.com:geofox/CORPUS.git` |
 | Main branch | `main` |
 | User | Geoffrey Richard, BIPT |
