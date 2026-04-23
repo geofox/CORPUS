@@ -2,7 +2,7 @@
 
 **Status:** Draft for review — ready for implementation planning
 **Created:** 2026-04-17
-**Last amended:** 2026-04-19 (three-critic review feedback folded in; §6 re-prioritized so Timers & SLAs is the next sub-project after Foundations)
+**Last amended:** 2026-04-23 (second three-agent review — operational practice / templating / process catalog — folded in; ~18 new decisions, templating subsystem redesigned, several new v0 entities: CaseLink, Inquiry, CaseRecusal, Decision, ConfidentialityClaim, FormalDocument, TemplateSet/Version/Fragment, LetterheadProfile; four new §6 sub-projects added — Formal Enforcement, In-app Collaboration, Operational Search, Bulk Ops & Migration). First amendment 2026-04-19 (first three-critic review — architecture / security / pragmatism — folded in; §6 re-prioritised so Timers & SLAs is the next sub-project after Foundations).
 **Scope (v0, this spec):** Foundations + Case, Party, Attachment & Event Timeline + Workflow Engine Skeleton (state machine, parallel/sub_process/triggers runtime, SLAs parsed but not fired) + Staff UI (dashboard, case detail tabs, AI Companion drawer) + AI Companion (v0 dummy-only LLM client) + remote access via Tailscale sidecar. Runs on Docker Compose locally; Azure deploy is its own later sub-project.
 **Next sub-project (recommended):** §6.1 Timers & SLAs — actual timer firing, reminder automation, breach-triggered escalation. Elevated from former §6.3 position because EU-mandated SLAs are non-negotiable regulator obligations, not internal targets.
 **Author:** Geoffrey Richard (with Claude)
@@ -37,13 +37,15 @@
 
 CORPUS is a **configurable workflow platform**, not a hardcoded complaint CRM. The Complaint Team authors processes (initially as reviewed YAML in git, later via a no-code designer); the engine runs them; every state change is captured in an append-only event timeline. AI-assisted triage, multilingual correspondence, bidirectional email, external forwarding with share bundles, and dashboards for oversight are all first-class features planned across the roadmap.
 
-**This first sub-project (the subject of this spec) establishes the Foundations:** domain model (including AI companion entities and complainant AI-opt-out), append-only event timeline with `schema_version` and evidence-integrity guarantees (SHA-256 re-verify on download, system-actor attribution, request-IP logging), attachment handling with soft-delete and share-bundle exclusion flags, the workflow engine skeleton (start/task/parallel/sub_process/end state types + triggers; `gateway`/`wait`/`spawn_and_continue`/`debounce` reserved; SLAs declared but not fired), the **AI Companion** (drawer UI, workflow-scoped prompts, opt-out enforcement — v0 ships only the `dummy` LLM client, real providers land in §6.4 behind a DPO gate), and a staff UI (tabbed case detail, Complaint-Team dashboard with 5 widgets, escalate + send-reminder actions). Runs locally on Docker Compose with an isolated Tailscale sidecar for remote dev access.
+**This first sub-project (the subject of this spec) establishes the Foundations:** domain model (Case with priority + admissibility + closure-reason, Party with trusted-flagger, Event timeline with `schema_version` + evidence-integrity + system-actor attribution, Attachment with share-bundle exclusion flags, CaseLink for relationships/duplicates/merges, Inquiry for informal contacts, CaseRecusal for conflicts of interest, Decision + ConfidentialityClaim + FormalDocument shapes for formal regulator acts, AI Companion entities with complainant opt-out, and a full regulator-grade templating subsystem — TemplateSet + TemplateVersion + TemplateFragment + LetterheadProfile with state-machine approvals, multi-language stale-detection, and rendered-output audit), append-only event timeline with `schema_version`, the workflow engine skeleton (start/task/parallel/sub_process/end state types + event and scheduled triggers (shape for scheduled; firing in §6.1); `gateway`/`wait`/`spawn_and_continue`/`debounce` reserved; SLAs declared but not fired), the **AI Companion** (drawer UI, workflow-scoped prompts, opt-out enforcement — v0 ships only the `dummy` LLM client; real providers land in §6.4 behind a DPO gate), and a staff UI (tabbed case detail, Complaint-Team dashboard with 8 widgets, admissibility/priority/link/recusal actions, template admin + translations-pending queue, escalate + send-reminder actions). Seed includes an `admissibility_triage.yaml` scaffold alongside the DSA example, plus the `telecom-consumer` / `postal` categories (BIPT's pre-existing mandates). Runs locally on Docker Compose with an isolated Tailscale sidecar for remote dev access.
 
 **Next sub-project after Foundations: §6.1 Timers & SLAs** — the regulatory deadline loop (external EU-set SLAs, automatic reminders, breach-triggered escalations). Elevated to first position in the roadmap because SLA compliance is a core regulator obligation.
 
 **Explicit non-goals for v0:** public intake form, email I/O, AI-as-workflow-actor (proposals + review flow), real LLM provider clients (OpenAI/Anthropic/Azure OpenAI — behind DPO gate in §6.4), timer/SLA firing, external share-bundle dispatch, workflow designer UI, real Entra ID authentication, reporting & analytics dashboards, Azure deployment. Each is its own future sub-project (see §6) with v0 hooks already in place.
 
-**Post three-critic review (architecture / security / pragmatism):** the spec was amended on 2026-04-19 to lock in 19 additional decisions (cheap architectural hardening, security guardrails, DSL primitive restraint, scope trims, testing trims) driven by critic feedback. See decisions §7 #46–64 for the full list and rationale.
+**Post first three-critic review (architecture / security / pragmatism, 2026-04-19):** 19 additional decisions locked in (architectural hardening, security guardrails, DSL primitive restraint, scope trims, testing trims) — see §7 #46–64.
+
+**Post second three-agent review (operational practice / templating & components / process catalog, 2026-04-23):** ~18 further decisions locked in around missing operational primitives — closure taxonomy, admissibility gate, case links/merges, inquiry entity, trusted-flagger support, staff recusal/delegation, a redesigned regulator-grade templating subsystem, shape-only declarations for formal enforcement entities (Decision, ConfidentialityClaim, FormalDocument), a `schedule_triggers:` DSL block, four new §6 sub-projects, and CSV export endpoints. See §7 #65–82.
 
 ---
 
@@ -198,18 +200,63 @@ CORPUS runs as a small set of Compose services on a Linux host. Azure mapping is
 
 **Entities (v0):**
 
-- **`User`** — staff member. `id`, `email` (unique citext), `display_name`, `team_id`, `is_admin`, `external_id` (nullable, OIDC sub when Entra lands), `is_active`, timestamps.
+- **`User`** — staff member. `id`, `email` (unique citext), `display_name`, `team_id`, `is_admin`, `external_id` (nullable, OIDC sub when Entra lands), `is_active`, **`out_of_office_until` timestamptz nullable** (task-assignment logic skips users on leave), **`delegate_user_id` FK User nullable** (coverage target — tasks that would route to this user get offered to the delegate when OOO), timestamps.
 - **`Team`** — internal BIPT team. `id`, `slug` (`complaint`, `dsa`, `ai`, `market`), `display_name`, `description`, timestamps.
-- **`Party`** — any entity referenced in a case. `id`, `kind` enum `individual | organization | authority`, `display_name`, `language` enum `nl | fr | en | de`, `email`, `phone`, `address` jsonb, `metadata` jsonb, `is_anonymized` bool, `anonymized_at`, `ai_opt_out` bool default false (when true on a Party playing the `complainant` role, every case they're on gets AI disabled — the data subject has refused AI processing), `ai_opt_out_recorded_at` nullable, `ai_opt_out_source` enum `intake_form | staff_manual | email_reply | other` nullable, timestamps.
-- **`Case`** — the complaint aggregate. `id`, `reference` unique (`CORPUS-2026-0042`), `title`, `description`, `category_id` FK, `status` enum `draft | open | closed`, `received_at`, `closed_at`, `created_by_user_id` (nullable), `is_escalated` bool, `escalation_level` enum `team_lead | council | leadership` (nullable), `escalated_at` (nullable), `escalated_by_user_id` (nullable), `escalation_reason` (nullable), `ai_disabled` bool default false (effective flag: true if explicitly set OR any complainant Party has `ai_opt_out=true`; computed+stored so the UI check is a single column read), `ai_disabled_reason` text nullable (`complainant_opt_out | staff_decision | policy | other`), `ai_disabled_at` nullable, `ai_disabled_by_user_id` nullable FK, timestamps.
-- **`CaseCategory`** — seeded taxonomy. `id`, `slug` (`dsa`, `ai-act`, `data-act`), `display_name`, `description`, timestamps.
-- **`CaseParticipant`** — party's role on a case. `id`, `case_id`, `party_id`, `role` enum `complainant | target | authority | cc | other`, `added_at`, `metadata` jsonb. Unique on `(case_id, party_id, role)`.
+- **`Party`** — any entity referenced in a case. `id`, `kind` enum `individual | organization | authority`, `display_name`, `language` enum `nl | fr | en | de`, `email`, `phone`, `address` jsonb, `metadata` jsonb, `is_anonymized` bool, `anonymized_at`, `ai_opt_out` bool default false (when true on a Party playing the `complainant` role, every case they're on gets AI disabled — the data subject has refused AI processing), `ai_opt_out_recorded_at` nullable, `ai_opt_out_source` enum `intake_form | staff_manual | email_reply | other` nullable, **`is_trusted_flagger` bool default false** (DSA Article 22; surfaces as a priority flag at intake + dashboard badge), **`trusted_flagger_designation_ref` text nullable** (which official designation list, date granted), timestamps.
+- **`Case`** — the complaint aggregate. `id`, `reference` unique (`CORPUS-2026-0042`), `title`, `description`, `category_id` FK, `status` enum `draft | open | closed`, **`priority` enum `low | normal | high | urgent` default `normal`** (drives urgent-lane processes once §6.1 ships; surfaced in dashboard filters and CEL expressions; trusted-flagger complaints auto-start at `high`), **`priority_reason` text nullable**, **`priority_set_by_user_id` FK User nullable**, **`admissibility_decision` enum `pending | admissible | partially_admissible | inadmissible | redirected` default `pending`**, **`admissibility_decided_at` nullable**, **`admissibility_decided_by_user_id` nullable FK**, **`admissibility_note` text nullable** (reasoning; redirect target if `redirected`), **`closure_reason` enum nullable** (`out_of_scope | redirected | dismissed_abuse | dismissed_duplicate | dismissed_time_barred | resolved | forwarded | withdrawn | referred_ex_officio | admin_closed | other` — set when `status` moves to `closed`), **`closure_note` text nullable**, `received_at`, `closed_at`, `created_by_user_id` (nullable), `is_escalated` bool, `escalation_level` enum `team_lead | council | leadership` (nullable), `escalated_at` (nullable), `escalated_by_user_id` (nullable), `escalation_reason` (nullable), `ai_disabled` bool default false (effective flag: true if explicitly set OR any complainant Party has `ai_opt_out=true`; computed+stored so the UI check is a single column read), `ai_disabled_reason` text nullable (`complainant_opt_out | staff_decision | policy | other`), `ai_disabled_at` nullable, `ai_disabled_by_user_id` nullable FK, timestamps.
+- **`CaseCategory`** — seeded taxonomy. `id`, `slug`, `display_name`, `description`, `is_system` bool default false, timestamps. **Seeded:** `dsa`, `ai-act`, `data-act`, **`telecom-consumer`** (BIPT's pre-existing telecom-consumer mandate), **`postal`** (BIPT's postal-sector mandate), **`out_of_scope`** (catch-all for cases closed as inadmissible/out-of-competence — kept distinct from `other` to enable clean "closed elsewhere" reporting).
+- **`CaseParticipant`** — party's role on a case. `id`, `case_id`, `party_id`, `role` enum `complainant | target | authority | cc | representative | represented_party | trusted_flagger | witness | other` (extended from v0 minimal set — `representative` and `represented_party` pair for consumer-group / NGO / lawyer-filed complaints; `trusted_flagger` for DSA Art. 22 actors; `witness` for third-party testimony), `added_at`, `metadata` jsonb. Unique on `(case_id, party_id, role)`.
 - **`Event`** — append-only timeline. `id`, `case_id`, `sequence_number` (per-case monotonic bigint), `event_type` (dotted namespace), `schema_version` smallint NOT NULL default 1 (bumps when a payload shape changes; renderers dispatch on `(event_type, schema_version)`), `actor_type` enum `user | system | party`, `actor_user_id` (nullable), `actor_party_id` (nullable), `system_actor_ref` jsonb nullable (for `system` events: `{component, build_sha}` identifying which service/version emitted it), `request_ip` inet nullable, `user_agent` text nullable (populated on user-triggered events — read/download audit trail), `via_ai_agent_id` (nullable FK AIAgent — set when a human action was AI-assisted), `from_interaction_id` (nullable FK AIInteraction — specific invocation that produced content the user used), `payload` jsonb, `occurred_at`, `recorded_at`. **No `UPDATE`/`DELETE` allowed.** The AI fields preserve the "human is always the actor" principle (§4.8) while making AI assistance auditable.
 - **`Attachment`** — evidence. `id`, `case_id`, `event_id` (nullable), `original_filename`, `content_type` (sniffed, not trusted), `size_bytes`, `checksum_sha256`, `storage_key` (opaque UUID-based), `category_id` FK (NOT NULL, defaults to `other`), `is_internal` bool (never shareable externally when true), `uploaded_by_user_id`, `uploaded_by_party_id` (for future intake/email), `description`, `is_deleted` bool (soft delete), `deleted_at`, `deleted_by_user_id`, timestamps.
 - **`AttachmentCategory`** — admin-managed. `id`, `slug`, `display_name`, `description`, `is_system` (prevents deletion), `display_order`, `is_shareable_default` bool NOT NULL default true (when false, attachments of this category are excluded from future share bundles by default even if `is_internal=false` — safety rail for categories that are usually internal like `internal_note`), timestamps. Seeded: `evidence` (shareable), `correspondence` (shareable), `contract` (shareable), `screenshot` (shareable), `internal_note` (**not shareable** by default), `other` (shareable).
 - **`ProcessInstance`** — one process running on a case. `id`, `case_id`, `process_id`, `process_version`, **`process_definition_snapshot` jsonb NOT NULL** (the full compiled process definition as of instance creation — the engine executes against *this* snapshot, never the live file on disk; PRs that edit `processes/*.yaml` never break running instances), `current_state`, `status` enum `running | completed | cancelled | error`, `kind` enum `main | spawned | triggered`, `parent_instance_id` (nullable, for sub-processes), `context` jsonb, `started_at`, `ended_at`, timestamps. **Partial unique index**: `(case_id) WHERE kind = 'main' AND status = 'running'` — one main per case. **Multiple concurrent instances are allowed** (main + spawned + triggered).
 - **`Task`** — work item. `id`, `process_instance_id`, `case_id` (denormalized), `task_key`, `title`, `description`, `assigned_to_user_id` (nullable), `assigned_to_team_id` (nullable), `status` enum `open | claimed | completed | cancelled`, `outcome` (drives transitions), `data` jsonb (form data), `created_at`, `claimed_at`, `completed_at`, `completed_by_user_id`.
-- **`Template`** — correspondence text (text only v0; email subject field reserved). `id`, `slug`, `language` enum `nl | fr | en | de`, `subject` (nullable), `body` (Jinja2 placeholders; rendering via the `jinja2` package with an autoescaped, sandboxed environment), timestamps. Unique on `(slug, language)`.
+**Regulator-grade templating subsystem** (§4.2 reorganised from the single minimal `Template` entity into a versioned, governed, multi-language system — the current thin model is legally unusable for regulator correspondence):
+
+- **`TemplateSet`** — the logical "template" identity. `id`, `slug` (e.g., `dsa.ack_receipt`), `canonical_language` enum `nl | fr | en | de` (the language the master version is authored in; others are translations), `variables_schema` jsonb (JSON Schema declaring the context variables required/optional + types; validated at DSL-load time and at render time — same spirit as CEL/reachability checks), `category` enum `official | informal | reminder | internal_note | holding_letter | info_request | decision | publication` (drives governance rules), `render_targets` enum[] `plain_text | html_email | pdf_letterhead` (what output types this template supports — PDF pipeline lands with §6.2 Email I/O), `is_active` bool, `description` text, timestamps.
+- **`TemplateVersion`** — a concrete, reviewable version in a specific language. `id`, `template_set_id` FK, `language`, `version` (semver), `subject` text nullable, `body` text (Jinja2; sandboxed autoescape env), `state` enum `draft | in_review | approved | retired`, `source_version_id` FK TemplateVersion nullable (the canonical-language version this translation was made from — when the canonical version is `approved`, sibling-language versions with a different `source_version_id` are auto-marked `stale`), `translation_status` enum `fresh | stale | missing | machine_draft | human` (derived from state + source_version_id), `author_user_id` FK User, `approved_by_user_id` FK User nullable, `approved_at` nullable, `retired_at` nullable, `changelog` text, timestamps. Unique on `(template_set_id, language, version)`.
+- **`TemplateFragment`** — reusable snippets for standard blocks (legal footer, "your rights" block, signature block). `id`, `slug` (e.g., `footer.dsa_article21`), `language`, `version`, `body` (Jinja2), `state` enum (same as TemplateVersion), `approved_by_user_id`, `approved_at`, timestamps. Referenced from `TemplateVersion.body` via `{% include_fragment "footer.dsa_article21" %}` — resolves to the latest approved fragment in the recipient's language.
+- **`LetterheadProfile`** — styled-output description for PDF rendering (shape v0; pipeline via WeasyPrint lands with §6.2). `id`, `slug` (e.g., `bipt_official`), `logo_ref` (reference to a bundled asset in the repo — *not* an Attachment), `address_block` text, `font_family`, `page_margins` jsonb, `signatory_user_id` FK User (who signs outbound formal letters from this letterhead), `is_default` bool, timestamps.
+
+**Rendered-output audit invariant:** every `template.rendered` event stores either the full rendered text in `payload.rendered_text` (for plain text and HTML email bodies ≤ 16 KB) or an `attachment_id` pointer to an `Attachment` row containing the rendered PDF (for `pdf_letterhead` outputs). Rendered outputs are never re-computed after the fact — "what we actually sent" is preserved verbatim for legal defensibility. The event payload carries `template_set_id`, `template_version_id`, `fragment_version_ids[]`, `recipient_party_id`, `recipient_language`, `fallback_used` bool, `input_hash` (sha256 of the serialised context; same pattern as `AIInteraction.input_hash`).
+
+**Fallback behaviour:** when rendering for a recipient in language L and no fresh TemplateVersion in L exists, the engine falls back to the canonical-language version, emits `template.fallback_used`, and surfaces a translation-pending item in the admin queue.
+
+**Variables context (standard shape available in every Jinja2 template unless the variables_schema explicitly narrows it):** `case` (reference, title, category, priority, status, received_at, closed_at), `recipient_party` (display_name, language, email, address), `sender_user` (display_name, role), `case_participants` (list filtered by role), `attachments_in_letter` (explicit list when a template chooses to reference live attachments), `now` (timezone-aware datetime), `corpus.footer`, `corpus.letterhead` (via fragment include).
+
+**DSL binding contract** (in `processes/*.yaml` `on_enter` / `on_complete` / `on_timeout` hooks):
+```yaml
+on_enter:
+  - action: render_template
+    args:
+      slug: dsa.ack_receipt              # template_set_id indirectly
+      recipient: "@case.complainant_party"
+      fragments_override:
+        footer: "footer.dsa_article21"
+      variables:
+        case_reference: "@case.reference"
+        expected_response_days: 30
+      render_target: plain_text          # or pdf_letterhead (v0 shape only)
+```
+At process-load time the engine cross-checks supplied `variables` against the TemplateSet's `variables_schema` and fails fast on mismatch. At render time, same check against the effective context. Reserved action `send_letter` (invokes `render_template` with `pdf_letterhead` target, stores as an `Attachment`, queues for email delivery once §6.2 ships).
+
+---
+
+Additional first-class v0 entities covering operational practice gaps the three missing-components critics surfaced:
+
+- **`CaseLink`** — explicit relationships between cases. `id`, `case_a_id` FK Case, `case_b_id` FK Case (`case_a_id < case_b_id` by ordering convention for dedup), `link_kind` enum `duplicate | related | parent_of | child_of | split_from | superseded_by`, `created_by_user_id`, `reason` text, `created_at`, `revoked_at` nullable, `revoked_by_user_id` nullable. Unique on `(case_a_id, case_b_id, link_kind)` where `revoked_at IS NULL`. Drives duplicate detection, umbrella-case handling (one incident → many complaints), merge/split bookkeeping. **Merge operation** emits `case.merged_into` on the absorbed side and `case.absorbed` on the retaining side; neither timeline is destroyed — absorbing a case pulls its events into the retaining case by emitting `case.event_reparented` markers. Split is the inverse.
+
+- **`Inquiry`** — lighter than a Case: someone asks "is this my complaint or a question?" before becoming a formal complaint. `id`, `from_party_id` FK Party, `subject` text, `body` text, `received_at`, `language`, `channel` enum `email | phone | walk_in | form | other`, `assigned_to_user_id` FK User nullable, `status` enum `open | awaiting_info | promoted | closed`, `promoted_to_case_id` FK Case nullable (when the inquiry becomes a formal complaint; the case's `description` is seeded from the inquiry's body and carries an `inquiry_origin_id`), `closed_at`, `closure_note`, timestamps. Short retention policy (anonymisable after N months — piggybacks on the Party anonymisation machinery). The v0 UI shows a separate `/inquiries` page; full public-facing inquiry form lands with §6.3 Public Intake.
+
+- **`CaseRecusal`** — staff conflict-of-interest markers. `id`, `case_id`, `user_id`, `reason` text, `recorded_at`, `recorded_by_user_id`. The task-assignment logic consults the case's active recusals and refuses to route tasks to any recused user — even via delegate rules. Unique on `(case_id, user_id)` where not revoked.
+
+- **`Decision`** — formal regulator act shape (v0 declares the entity; the full drafting → Council-approval → publication → appeal workflow is its own later sub-project §6.N "Formal Enforcement"). `id`, `case_id`, `decision_ref` text unique (`DEC-2026-0042`), `kind` enum `informal_resolution | formal_decision | no_action | redirect | settlement`, `signed_by_user_id` FK User nullable, `signed_at` nullable, `publication_status` enum `unpublished | pending_redaction | published | redacted_public`, `publication_url` text nullable, `appeal_deadline` nullable, `appeal_status` enum `none | filed | pending | upheld | annulled | withdrawn` default `none`, `appeal_filed_at` nullable, `appeal_closed_at` nullable, `appeal_outcome_note` text nullable, `body` text nullable (for v0 stub — full decision text moves to a TemplateVersion-backed render in the Formal Enforcement sub-project), timestamps. V0 API: read + manual-create; workflow integration deferred.
+
+- **`ConfidentialityClaim`** — commercial-secret / personal-data / legal-privilege markings on submissions. `id`, `claimant_party_id` FK Party (who is asserting the claim — typically the target operator), `attachment_id` FK Attachment nullable (for whole-attachment claims), `event_id` FK Event nullable (for claims over an event payload region — e.g., a specific section of a written submission), `region_selector` jsonb nullable (optional pointer into a structured event payload), `basis` enum `commercial_secret | personal_data | investigation_ongoing | legal_privilege | other`, `rationale` text, `claimed_at`, `reviewed_at` nullable, `review_outcome` enum `pending | upheld | partially_upheld | rejected` default `pending`, `reviewer_user_id` FK User nullable, `review_note` text nullable, `expires_at` nullable (some confidentiality claims have statutory lifespans), timestamps. Future share bundles (§6.5) and published-decision redaction pipelines honour **upheld** claims automatically.
+
+- **`FormalDocument`** — the "document-of-record" primitive distinct from generic Attachments + Templates. Formal RFIs, formal referrals to other authorities, formal notices — all have lifecycles that generic `Attachment + template.rendered` can't cleanly express. `id`, `case_id`, `kind` enum `rfi | referral | notice | decision_record` (`decision_record` is the Attachment-side manifestation of a `Decision` — the actual PDF), `reference` text unique, `issued_by_user_id` FK User, `issued_at`, `signed_by_user_id` FK User nullable, `attachment_id` FK Attachment nullable (the PDF/letter manifesting the document — produced by the templating pipeline when it ships), `status` enum `draft | issued | delivered | responded | closed`, `response_deadline` nullable (for RFIs, statutory response clock), `delivered_at` nullable, `responded_at` nullable, `response_event_id` FK Event nullable, timestamps. **V0 scope:** entity exists, basic read + manual-create API; the `rfi_to_operator.yaml` process + full RFI lifecycle + automatic reminder/escalation ships with §6.1 Timers.
+
+- **`Template`** *(legacy alias)* — the old single-row `Template` entity is replaced by `TemplateSet + TemplateVersion` (above). No rows survive — v0 starts fresh with the new model.
 - **`AIAgent`** — a configured LLM endpoint that the AI Companion can invoke. `id`, `slug` (`summarizer`, `translator`, `analyst`…), `display_name`, `description`, `provider` enum **`dummy` (v0)** | `openai` | `anthropic` | `azure_openai` (enum values exist, but **in v0 only `dummy` is accepted at agent creation**; the other providers + their `LLMClient` implementations land with §6.4 behind a DPO-sign-off gate), `model`, `endpoint` nullable, `api_key_secret_ref` (**name** of the env var or Key Vault secret; never the key itself), `default_prompt_prefix` nullable, `region` nullable (`eu` / `non-eu` — drives the PII warning UX), `is_active`, timestamps. See §4.8.
 - **`AIInteraction`** — append-only log of each AI Companion invocation. `id`, `case_id`, `user_id` (invoker), `agent_id` FK AIAgent, `prompt_slug` nullable (if a workflow-scoped or global prompt template was used), `prompt_version` (git rev of prompt at invocation), `interaction_kind` (`summarize | explain_attachment | draft_reply | chat | workflow_prompt`), `shared_input` jsonb (what was sent: included case fields, event ids, attachment ids — summarized, never raw), `input_hash` (sha256 of the assembled prompt), `prompt_rendered` text (the final prompt sent; internal-only), `output_text` text, `tokens_in`, `tokens_out`, `cost_estimate` nullable, `latency_ms`, `status` enum `ok | provider_error | rate_limited | cancelled`, `created_at`. See §4.8.
 
@@ -227,8 +274,31 @@ CORPUS runs as a small set of Compose services on a Linux host. Azure mapping is
 - `attachments(case_id) WHERE is_deleted = false` — default case attachment list.
 - `ai_interactions(case_id, created_at DESC)` — case-scoped AI history, recent-first.
 - `ai_interactions(user_id, created_at DESC)` — per-user AI usage rollup for cost awareness.
+- `case_links(case_a_id, link_kind) WHERE revoked_at IS NULL` — "related cases" lookups from either side (mirror index on `case_b_id`).
+- `cases(priority, received_at DESC) WHERE status <> 'closed'` — dashboard urgent-lane.
+- `cases(admissibility_decision) WHERE admissibility_decision = 'pending'` — admissibility triage inbox.
+- `inquiries(status, received_at DESC)` — inquiry inbox.
+- `template_versions(template_set_id, language, state)` — admin "translations pending" view.
+- `confidentiality_claims(attachment_id) WHERE review_outcome IN ('upheld','partially_upheld')` — share-bundle/publish redaction lookups.
+- `case_recusals(case_id) WHERE revoked_at IS NULL` — task-assignment check path.
 
-**Seed data on first boot (idempotent):** Teams (`complaint`, `dsa`, `ai`, `market`), case categories (`dsa`, `ai-act`, `data-act`), attachment categories with `is_shareable_default` flags (see §4.2), one dev user per team + one admin, Belgian region authorities (Flanders, Wallonia, Brussels), bare-bones NL/FR/EN templates for a minimal DSA flow, one demo case with a small timeline, **one `AIAgent` (`summarizer`) using the `dummy` provider** so the AI Companion is usable out of the box. Real-provider keys (OpenAI/Anthropic/Azure OpenAI) come back in §6.4.
+**Seed data on first boot (idempotent):**
+- Teams: `complaint`, `dsa`, `ai`, `market`.
+- Case categories: `dsa`, `ai-act`, `data-act`, `telecom-consumer`, `postal`, `out_of_scope` (seeded `is_system=true` for the last one to prevent accidental deletion).
+- Attachment categories with `is_shareable_default` flags (see §4.2).
+- One dev user per team + one admin (with `out_of_office_until=null`, `delegate_user_id=null`).
+- Belgian region authorities (Flanders, Wallonia, Brussels) as `Party(kind=authority)`.
+- **TemplateSets seeded for v0 DSA scaffold** (canonical_language=`nl`, versions in NL/FR/EN, state=`approved`):
+  - `dsa.ack_receipt` (category=`official`, render_targets=`[plain_text]`),
+  - `dsa.region_forward` (category=`official`),
+  - `dsa.final_response` (category=`official`),
+  - `reminder.authority_response` (category=`reminder`),
+  - `holding_letter.generic` (category=`holding_letter`, reserved for §6.1 Timers),
+  - `admissibility.redirect` (category=`official`).
+- **TemplateFragments** for shared blocks: `footer.legal_rights` (BIPT standard GDPR/rights block), `signature.complaint_team` (signature block).
+- **LetterheadProfile** `bipt_official` (shape only in v0; PDF rendering ships with §6.2).
+- One demo case with a small timeline, one demo `Inquiry` (to show the inquiry → case promotion path), one demo `CaseLink` between two cases (duplicate).
+- **One `AIAgent` (`summarizer`) using the `dummy` provider** so the AI Companion is usable out of the box. Real-provider keys (OpenAI/Anthropic/Azure OpenAI) come back in §6.4.
 
 ### 4.3 Workflow DSL
 
@@ -251,7 +321,13 @@ context_schema:
 triggers:                              # optional — event-spawned processes
   - event_type: "external.info_received"
     when: "event.payload.from_role == 'complainant'"
-    debounce: 10m
+    debounce: 10m                      # RESERVED — not wired in v0
+
+schedule_triggers:                     # optional — calendar-driven processes (SHAPE RESERVED in v0; firing via §6.1 Timers)
+  - slug: annual_dsa_transparency_report
+    cron: "0 4 1 1 *"                  # yearly, Jan 1 04:00
+    spawns_process: "annual_report_aggregation"
+    when: "now().year > 2026"          # optional CEL gate
 slas:                                  # optional — deadlines as observers
   - name: final_response
     duration: 30d
@@ -295,9 +371,35 @@ Reserved for later sub-projects: `timer`, `script` (§6.1 / §6.4). `triggers.de
 
 **Actions (hooks `on_enter`, `on_complete`, `on_timeout`):**
 
-Initial vocabulary: `log_event`, `render_template`, `add_participant`, `set_context`, `set_case_status`.
+Initial vocabulary: `log_event`, `render_template`, `add_participant`, `set_context`, `set_case_status`, `set_admissibility`, `set_priority`, `record_recusal`, `link_case`.
 
-Reserved (wired in later sub-projects): `start_timer`, `cancel_timer`, `send_email`, `share_attachments`, `call_ai_triage`, `forward_to_authority`, `send_reminder`, `escalate`, `notify_team`.
+**`set_case_status` extended signature:**
+
+```yaml
+- action: set_case_status
+  args:
+    value: closed
+    closure_reason: resolved              # enum, required when value=closed
+    closure_note: "Complainant confirmed operator remediation 2026-04-15."
+```
+
+**`set_admissibility`:**
+
+```yaml
+- action: set_admissibility
+  args:
+    decision: redirected                  # admissible | partially_admissible | inadmissible | redirected
+    redirect_to: "authority:apd_gba"       # party ref
+    note: "Pure GDPR matter — BIPT lacks competence; forwarded to APD/GBA."
+```
+
+Reserved (wired in later sub-projects): `start_timer`, `cancel_timer`, `send_email`, `send_letter` (PDF via letterhead), `share_attachments`, `call_ai_triage`, `forward_to_authority`, `send_reminder`, `send_holding_letter`, `escalate`, `notify_team`, `issue_rfi` (produces a `FormalDocument` of kind `rfi`), `issue_decision` (produces a `FormalDocument` of kind `decision_record` and a `Decision` row), `link_case`, `merge_case_into`, `publish_decision`.
+
+**Task `kind` values** — `Task.task_key` is a per-process identifier; `Task.kind` (new enum) classifies the task shape for UI rendering and engine semantics. v0 kinds:
+- `generic` (default — standard form task),
+- `admissibility_review` (UI variant showing the admissibility panel),
+- `ai_review` (already specified in §4.8 — reserved for §6.4),
+- `request_for_information` (RESERVED — the `issue_rfi` action and RFI task UI ship with §6.1 Timers alongside the `rfi_to_operator.yaml` scaffold).
 
 **Task assignment:**
 
@@ -460,19 +562,23 @@ Accompanied by `/processes/forward_to_regions.yaml` (parallel Flanders/Wallonia/
 
 | Namespace | Events |
 |---|---|
-| `case.*` | `case.created`, `case.title_updated`, `case.description_updated`, `case.status_changed`, `case.closed`, `case.escalated`, `case.escalation_resolved` |
+| `case.*` | `case.created`, `case.title_updated`, `case.description_updated`, `case.status_changed`, `case.closed` (payload carries `closure_reason` + `closure_note`), `case.escalated`, `case.escalation_resolved`, `case.admissibility_decided`, `case.redirected` (subtype when admissibility → redirected), `case.priority_changed`, `case.linked`, `case.unlinked`, `case.merged_into` (on absorbed case), `case.absorbed` (on retaining case), `case.event_reparented` (emitted on retaining case for each event pulled in from an absorbed case), `case.recusal_recorded`, `case.recusal_revoked`, `case.reopened` |
 | `participant.*` | `participant.added`, `participant.removed`, `participant.role_updated` |
-| `party.*` | `party.created`, `party.updated`, `party.anonymized` |
+| `party.*` | `party.created`, `party.updated`, `party.anonymized`, `party.trusted_flagger_granted`, `party.trusted_flagger_revoked` |
+| `inquiry.*` | `inquiry.created`, `inquiry.updated`, `inquiry.assigned`, `inquiry.promoted` (payload has `promoted_to_case_id`), `inquiry.closed` |
 | `attachment.*` | `attachment.added`, `attachment.downloaded`, `attachment.deleted`, `attachment.category_changed`, `attachment.visibility_changed`, `attachment.content_verified` (sha256 re-verify on download matched stored checksum), `attachment.content_mismatch` (sha256 re-verify failed — evidence integrity alert) |
 | `process.*` | `process.started`, `process.state_entered`, `process.state_exited`, `process.ended`, `process.error` |
 | `task.*` | `task.created`, `task.claimed`, `task.completed`, `task.cancelled`, `task.reassigned` |
 | `external.*` | `external.info_received`, `external.reply`, `external.forward_sent` |
-| `template.*` | `template.rendered` |
+| `template.*` | `template.version_drafted`, `template.version_submitted_for_review`, `template.version_approved`, `template.version_retired`, `template.translation_marked_stale`, `template.rendered` (payload includes `template_set_id`, `template_version_id`, `fragment_version_ids[]`, `recipient_party_id`, `recipient_language`, `fallback_used`, `input_hash`, `rendered_text` OR `attachment_id`), `template.fallback_used` |
+| `decision.*` | `decision.drafted`, `decision.issued`, `decision.published`, `decision.redacted`, `decision.appealed`, `decision.appeal_upheld`, `decision.appeal_annulled`, `decision.appeal_withdrawn` (SHAPE in v0; full workflow in Formal Enforcement sub-project) |
+| `confidentiality.*` | `confidentiality.claimed`, `confidentiality.reviewed_upheld`, `confidentiality.reviewed_partially_upheld`, `confidentiality.reviewed_rejected`, `confidentiality.expired` |
+| `formal_document.*` | `formal_document.drafted`, `formal_document.issued`, `formal_document.delivered`, `formal_document.responded`, `formal_document.closed` (SHAPE in v0; rfi/decision/referral workflows ship with §6.1 / Formal Enforcement sub-project) |
 | `reminder.*` | `reminder.sent` |
 | `sla.*` | `sla.started`, `sla.breached` (shape only; firing deferred) |
 | `comment.*` | `comment.added`, `comment.edited`, `comment.deleted` |
 | `ai.*` | `ai.queried` (companion invocation logged), `ai.invocation_blocked` (attempt on an AI-disabled case, for audit), `case.ai_disabled`, `case.ai_enabled` (re-enablement), `party.ai_opt_out_set`, `party.ai_opt_out_cleared`. AI never acts *as* an actor — this namespace is for audit of human-invoked AI usage and of the consent/opt-out lifecycle. See §4.8. |
-| `admin.*` | `admin.process_reloaded`, `admin.reassignment_override`, `admin.ai_agent_created`, `admin.ai_agent_updated` |
+| `admin.*` | `admin.process_reloaded`, `admin.reassignment_override`, `admin.bulk_reassignment`, `admin.user_out_of_office_set`, `admin.user_delegate_set`, `admin.ai_agent_created`, `admin.ai_agent_updated`, `admin.template_set_created`, `admin.letterhead_updated` |
 
 Each type has a JSON Schema validator in `backend/src/corpus/events/schemas/`. Unknown types fail validation at the service boundary — typo prevention.
 
@@ -520,6 +626,15 @@ Route-level authz via composable dependencies: `require_admin`, `require_team_me
 - `POST /api/cases/{id}:escalate` — `{level, reason}`.
 - `POST /api/cases/{id}:resolve-escalation` — `{note}`.
 - `POST /api/cases/{id}:send-reminder` — `{target_kind, target_id, template_slug, note?}` (v0: logs event only; later: dispatches email).
+- `POST /api/cases/{id}:set-priority` — `{priority, reason}`. Emits `case.priority_changed`.
+- `POST /api/cases/{id}:set-admissibility` — `{decision, redirect_to_party_id?, note}`. Emits `case.admissibility_decided` (+ `case.redirected` when `decision=redirected`).
+- `POST /api/cases/{id}:reopen` — `{reason}`. Admin only. Status goes `closed` → `open`, emits `case.reopened`.
+- `POST /api/cases/{id}/links` — body `{target_case_id, link_kind, reason}`. Emits `case.linked`.
+- `DELETE /api/cases/{id}/links/{link_id}` — `{reason}`. Emits `case.unlinked`.
+- `POST /api/cases/{id}:merge-into/{target_case_id}` — body `{reason}`. Admin-only. Emits `case.merged_into` (source) + `case.absorbed` + `case.event_reparented` (target). Reversible via `:split-from` within 7 days.
+- `GET /api/cases/{id}/related` — list linked + merged-ancestor + split-child cases.
+- `POST /api/cases/{id}/recusals` — body `{user_id, reason}`. Emits `case.recusal_recorded`.
+- `DELETE /api/cases/{id}/recusals/{recusal_id}` — `{reason}`. Emits `case.recusal_revoked`.
 
 **Timeline**
 - `GET /api/cases/{id}/events` — paginated with type prefix filter, actor filter, date range.
@@ -555,8 +670,28 @@ Route-level authz via composable dependencies: `require_admin`, `require_team_me
 **Comments**
 - `POST /api/cases/{id}/comments`, `PATCH/DELETE /api/cases/{id}/comments/{id}`.
 
-**Templates**
-- `GET /api/templates`, `POST /api/templates/{slug}:render`.
+**Inquiries**
+- `GET /api/inquiries` — list with filters (status, assigned_to_user_id, from_party_id, received_from/to).
+- `POST /api/inquiries` — create (v0 staff-entered; public-form intake ships with §6.3).
+- `GET /api/inquiries/{id}` — detail with thread-like body history.
+- `PATCH /api/inquiries/{id}` — update fields.
+- `POST /api/inquiries/{id}:assign` — `{user_id}`. Emits `inquiry.assigned`.
+- `POST /api/inquiries/{id}:promote` — body `{case_data}` (category, title, initial process, participants). Creates a `Case` seeded from the inquiry, sets `inquiry.status=promoted`, `inquiry.promoted_to_case_id`. Emits `inquiry.promoted`.
+- `POST /api/inquiries/{id}:close` — `{reason, note}`. Emits `inquiry.closed`.
+
+**Templates (new subsystem — CRUD + versioning + preview)**
+- `GET /api/templates` — list TemplateSets, optionally with per-language status.
+- `GET /api/templates/{slug}` — TemplateSet detail with its versions across languages.
+- `POST /api/admin/templates` — create new TemplateSet (admin only).
+- `POST /api/admin/templates/{slug}/versions` — propose a new version (draft state). Body: `{language, body, subject?, version, changelog, source_version_id?}`.
+- `POST /api/admin/templates/{slug}/versions/{id}:submit-for-review`.
+- `POST /api/admin/templates/{slug}/versions/{id}:approve` — admin only. Emits `template.version_approved`. Auto-marks sibling-language non-`source_version_id`-matching versions as `stale`.
+- `POST /api/admin/templates/{slug}/versions/{id}:retire`.
+- `GET /api/admin/templates/translations-pending` — list TemplateSets with stale or missing translations.
+- `GET /api/admin/template-fragments`, `POST /api/admin/template-fragments/*` — parallel CRUD for fragments.
+- `GET /api/admin/letterheads`, `POST /api/admin/letterheads` (admin only; shape in v0, rendering in §6.2).
+- `POST /api/cases/{id}/templates/{slug}:preview` — render with the case's real context (no side effects) and return `{subject, body, missing_vars[], warnings[], fallback_used}`. Used by the Send-Reminder drawer and any future pre-send confirmation UI.
+- `POST /api/cases/{id}/templates/{slug}:render` — render + log `template.rendered` + store output. Used by engine actions and by staff actions that need an audited rendering.
 
 **Admin / support** *(v0 scope narrowed per decision C2-mixed — deferred items land in a later admin-polish sub-project or §6.4)*
 - `GET /api/admin/health` — DB, process-registry, and evidence-integrity status (any `attachment.content_mismatch` alerts).
@@ -565,6 +700,26 @@ Route-level authz via composable dependencies: `require_admin`, `require_team_me
 - `GET /api/teams`, `GET /api/users` (read-only v0).
 - `GET /api/me`.
 - **Deferred from v0 admin surface** (land with §6.4 / admin-polish): `POST/PATCH /api/admin/categories/cases`, `POST/PATCH /api/admin/ai-agents`, `GET /api/admin/ai-usage`.
+
+**Decisions & formal acts (shape only in v0; full workflow in the Formal Enforcement sub-project)**
+- `GET /api/cases/{id}/decisions` — list decisions on a case.
+- `POST /api/cases/{id}/decisions` — create a decision (manual draft in v0).
+- `GET /api/decisions/{id}`, `PATCH /api/decisions/{id}` — read/update.
+- `GET /api/cases/{id}/formal-documents`, `POST /api/cases/{id}/formal-documents` — formal document lifecycle (stub create; full RFI/referral flows in §6.1 / later).
+
+**Confidentiality claims**
+- `POST /api/cases/{id}/confidentiality-claims` — `{claimant_party_id, attachment_id?, event_id?, basis, rationale, expires_at?}`. Emits `confidentiality.claimed`.
+- `POST /api/confidentiality-claims/{id}:review` — `{outcome, note}`. Admin-ish (reserved to specific roles in a later RBAC refinement; v0 permits Complaint Team + admin).
+- `GET /api/cases/{id}/confidentiality-claims` — list on case.
+
+**Staff operational**
+- `PATCH /api/admin/users/{id}` — extended with `out_of_office_until` + `delegate_user_id`. Emits `admin.user_out_of_office_set` / `admin.user_delegate_set`.
+- `POST /api/admin/tasks:bulk-reassign` — body `{from_user_id | from_team_id, to_user_id | to_team_id, filters?}`. Admin only. Emits one `admin.bulk_reassignment` event + per-task `task.reassigned`.
+
+**Exports (basic v0 shape; full reporting in a later sub-project)**
+- `GET /api/cases:export.csv?{filters}` — streamed CSV of cases matching filters (for Council reports and ad-hoc analyses). Columns: `reference, title, category, priority, status, received_at, closed_at, closure_reason, assigned_team, is_escalated, ai_disabled`. Content-Disposition attachment.
+- `GET /api/events:export.csv?case_id=` — streamed CSV of events on a single case (timeline snapshot).
+- Future: XLSX for Council reports, DSA Transparency DB JSON — land in Formal Enforcement / Reporting sub-project.
 
 **Dashboard**
 - `GET /api/dashboard/complaint-team` — aggregated widget data in one response (filters: category, date_range). Complaint Team / admin only.
@@ -619,15 +774,23 @@ Simple, testable, generalizable when the RBAC sub-project lands.
 | `/` | other staff | **My Work** — open tasks + team queue + recent cases I touched. |
 | `/cases` | all (scoped) | Filterable table of cases. |
 | `/cases/new` | all | Create form. |
-| `/cases/:id` | scoped | **Case detail** — tabbed (Timeline default / Details / Participants / Attachments / Processes / Comments). Sticky header with reference, status, escalation badge, "Escalate", "Send reminder", "Close case" actions. Persistent **"AI Assistant"** button opens the companion drawer (§4.8). |
+| `/cases/:id` | scoped | **Case detail** — tabbed (Timeline default / Details / Participants / Attachments / Processes / **Decisions** / **Confidentiality** / **Related** / Comments). Sticky header with reference, **priority badge** (low/normal/high/urgent — urgent rendered red), **admissibility badge** (pending/admissible/redirected/etc.), status, escalation badge, **AI-disabled badge** (if applicable). Header actions: "Escalate", "Send reminder", "Close case" (opens a modal that forces choosing a `closure_reason`), "Set priority", "Set admissibility", **"Link to related case"** (opens CaseLink modal), **"Record recusal"** (for team leads noting own COI). Persistent **"AI Assistant"** button opens the companion drawer (§4.8) — disabled with tooltip when `Case.ai_disabled`. |
 | `/tasks`, `/tasks/:id` | all | Inbox + task detail with dynamic form. |
 | `/parties`, `/parties/:id` | all | Directory + detail. |
 | `/processes`, `/processes/:id/:version` | all | Loaded processes + validation status. |
 | `/admin/categories/attachments` | admin | CRUD (v0 — explicitly requested). |
 | `/admin/categories/cases` | admin | **Read-only v0** — CRUD deferred; new categories via migration. |
-| `/admin/teams`, `/admin/users` | admin | Read-only v0. |
+| `/admin/teams`, `/admin/users` | admin | **Extended v0**: users list shows `out_of_office_until` + delegate; admin can toggle OOO and set delegate on any user. Emits `admin.user_out_of_office_set`. |
 | `/admin/ai-agents` | admin | **Read-only v0** (shows the seeded dummy agent); CRUD ships with §6.4. |
 | `/admin/ai-usage` | admin | **Deferred to §6.4** — meaningless under dummy-only A3. |
+| `/inquiries`, `/inquiries/:id` | all (scoped) | Lightweight inbox for informal contacts; promote button creates a Case. |
+| `/admin/templates` | admin | **TemplateSet list with per-language status columns** (approved / stale / missing / draft). Click into `/admin/templates/{slug}` for version history, diff view, approve/retire actions. |
+| `/admin/templates/{slug}` | admin | **Template detail**: all versions across languages, state machine visualised, diff view between versions, preview-against-a-case button. |
+| `/admin/template-fragments` | admin | Parallel CRUD for shared fragments. |
+| `/admin/letterheads` | admin | **v0 read-only** (shows seeded `bipt_official`); CRUD + PDF preview lands with §6.2 Email I/O. |
+| `/admin/translations-pending` | admin | Queue of stale/missing translations, sortable by category importance. |
+| `/cases/:id/decisions/:id` | scoped | **Decision detail** (v0 shape only) — shows decision_ref, kind, signatory, publication status, appeal status, body. Editable manually in v0; full workflow in Formal Enforcement sub-project. |
+| `/cases/:id/confidentiality` | scoped | Tab showing ConfidentialityClaims on the case and their review state. Admin/Complaint-Team can review (upheld/partially/rejected). |
 
 #### 4.6.3 Complaint Team dashboard widgets
 
@@ -635,6 +798,9 @@ Simple, testable, generalizable when the RBAC sub-project lands.
 - **Escalations** — currently escalated cases with level, reason, days open.
 - **Stalled cases** — top N by "days since last event" across all categories. **v0 fixed 14-day threshold**; per-category config lands with §6.1 Timers.
 - **Upcoming deadlines** — **cut from v0** — placeholder without SLA firing; widget lights up when §6.1 Timers ships.
+- **Admissibility pending** — cases with `admissibility_decision='pending'` older than N hours (default 48). Regulators tend to decide admissibility quickly; a pending queue is a signal of intake overload.
+- **Urgent priority** — cases with `priority='urgent'` open. Small card with count + drill-through.
+- **Translations pending** (admin-filtered) — count of TemplateSets where any language is `stale` or `missing`.
 - **Recent activity** — last 20 events across all cases, grouped by case.
 - **My tasks / My team's queue** — personal inbox.
 
@@ -957,17 +1123,17 @@ Each entry below is a candidate for its own brainstorm → spec → plan cycle. 
 ### 6.1 Timers & SLAs **(recommended next after Foundations — mandatory)**
 
 - **Why first:** CORPUS's obligations include EU-mandated deadlines (DSA acknowledgement windows, response-to-complainant timelines, Article-21-type review SLAs, regional-authority response clocks). These are externally-set regulator obligations, not internal targets. The platform's job is to track them reliably, surface breaches clearly, and generate the auditable record that BIPT can defend to the Council and to EU bodies. Everything else (Email I/O, Public Intake, AI Triage) depends on or is qualified by this.
-- **What:** actual timer firing (durable scheduler); SLA breach detection + `notify_team` / `send_reminder` / `escalate` side-effects on breach; `all_or_timeout` join policy; per-branch SLAs on parallel fan-out; the `Upcoming deadlines` dashboard widget lighting up; `Stalled cases` widget becoming per-category configurable; `start_timer` / `cancel_timer` DSL actions implemented; `on_timeout` hook firing.
+- **What:** actual timer firing (durable scheduler); SLA breach detection + `notify_team` / `send_reminder` / `send_holding_letter` / `escalate` side-effects on breach; `all_or_timeout` join policy; per-branch SLAs on parallel fan-out; the `Upcoming deadlines` dashboard widget lighting up; `Stalled cases` widget becoming per-category configurable; `start_timer` / `cancel_timer` DSL actions implemented; `on_timeout` hook firing; **scheduled triggers firing** (`schedule_triggers:` block from §4.3); `issue_rfi` DSL action + `request_for_information` task kind UI; new scaffolds: `rfi_to_operator.yaml` (formal RFI with deadline/extension tracking), `urgent_lane.yaml` (uses v0 `Case.priority`), `holding_letter_on_sla_risk.yaml` (auto-send holding letter at 80% SLA elapsed).
 - **Depends on:** Foundations.
-- **V0 hooks in place:** `slas:` block parsed and validated in DSL; `start_timer`/`cancel_timer`/`on_timeout` reserved action vocabulary; `slas:` stored on process definitions; `case.ai_disabled` / escalation lifecycle.
-- **Key open questions:** durable scheduler choice (Celery+Redis? `pg_boss` via asyncpg? Postgres-backed custom using `LISTEN/NOTIFY` + advisory locks?); timezone handling (UTC in DB, render local); business-day vs calendar-day SLAs per-category; reminder-cadence defaults; what should happen on engine downtime during a scheduled firing (catch-up vs skip).
+- **V0 hooks in place:** `slas:` block parsed and validated in DSL; `start_timer`/`cancel_timer`/`on_timeout` reserved action vocabulary; `slas:` stored on process definitions; `schedule_triggers:` shape reserved; `Case.priority` field; `FormalDocument` entity for RFI output; `case.ai_disabled` / escalation lifecycle.
+- **Key open questions:** durable scheduler choice (Celery+Redis? `pg_boss` via asyncpg? Postgres-backed custom using `LISTEN/NOTIFY` + advisory locks?); timezone handling (UTC in DB, render local); business-day vs calendar-day SLAs per-category; reminder-cadence defaults; what should happen on engine downtime during a scheduled firing (catch-up vs skip); holding-letter threshold default (80%? 90%?).
 
 ### 6.2 Email I/O (recommended second — naturally pairs with Timers)
 
-- **What:** inbound mailbox parsing (new complaints, replies threaded to existing cases) and outbound sending (acks, info requests, reminders that §6.1 schedules, forwards). Probably Exchange Online via Microsoft Graph API given BIPT's Microsoft-shop context.
+- **What:** inbound mailbox parsing (new complaints, replies threaded to existing cases) and outbound sending (acks, info requests, reminders that §6.1 schedules, forwards). Probably Exchange Online via Microsoft Graph API given BIPT's Microsoft-shop context. **PDF letterhead pipeline** lives here (WeasyPrint rendering TemplateVersions with `render_target=pdf_letterhead` into Attachment rows bound to `LetterheadProfile`). **New scaffolds:** `status_query_response.yaml` (triggered on inbound email matched to existing case, body detected as status inquiry), `cross_border_referral.yaml` (DSC-to-DSC coordination under DSA), `consent_withdrawal_midcase.yaml` (triggered on `party.ai_opt_out_set`).
 - **Depends on:** Foundations; timers (for reminder dispatch).
-- **V0 hooks:** Template entity; `reminder.sent` and `external.*` events; `Attachment.event_id`; `external-events` endpoint as shared client.
-- **Key open questions:** Graph vs IMAP; thread-matching strategy (`References`/`In-Reply-To` vs reference-in-subject); bounce handling; DKIM/SPF setup; legal archive retention; opt-in to store full raw emails as `.eml` attachments for evidence.
+- **V0 hooks:** TemplateSet/Version/Fragment/LetterheadProfile entities; `reminder.sent` and `external.*` events; `Attachment.event_id`; `external-events` endpoint as shared client; Jinja2 rendering pipeline.
+- **Key open questions:** Graph vs IMAP; thread-matching strategy (`References`/`In-Reply-To` vs reference-in-subject); bounce handling; DKIM/SPF setup; legal archive retention; opt-in to store full raw emails as `.eml` attachments for evidence; PDF font/layout choices.
 
 ### 6.3 Public Intake Form (recommended third)
 
@@ -1041,14 +1207,42 @@ Each entry below is a candidate for its own brainstorm → spec → plan cycle. 
 - **V0 hooks:** simple team-membership-based rule; composable FastAPI dependencies.
 - **Key open questions:** role taxonomy; ACL granularity (category? case? field?); separation-of-duties rules (no escalation author as own resolver?); admin-bypass logging.
 
-### 6.13 Webhook out / integrations
+### 6.13 Formal Enforcement (Decisions, appeals, transparency publication)
+
+- **What:** full lifecycle for formal acts that v0 declares as entities (`Decision`, `FormalDocument`): drafting → internal review → Council approval → signature → publication (with redaction pipeline that honours upheld `ConfidentialityClaim`s) → appeal-window tracking → Market Court / Conseil d'État coordination → annulment/upholding recording. DSA Transparency Database submission adapter (Art. 24). Sanction tracking (fines, injunctions, periodic penalties).
+- **Depends on:** Foundations (entities exist); §6.1 Timers (appeal deadlines); §6.2 Email I/O (formal service of decisions); §6.6 Real Auth (Council approval needs real identities).
+- **V0 hooks in place:** `Decision`, `FormalDocument`, `ConfidentialityClaim` entities declared; `decision.*` / `formal_document.*` / `confidentiality.*` event namespaces reserved; `issue_decision` / `publish_decision` DSL actions reserved.
+- **Key open questions:** signature mechanism (eID-backed digital signature? qualified electronic signature under eIDAS?); Market Court registry integration (manual vs. automated event ingestion); DSA Transparency DB format (JSON schema from the Commission); publication workflow roles (who redacts, who approves redactions); retention policy for published vs unpublished decisions.
+
+### 6.14 In-app Collaboration (notifications, @mentions, subscriptions, watchlists)
+
+- **What:** `Notification` entity + `CaseSubscription(user_id, case_id, reason)` + bell-icon notification centre in the UI + `@user-mention` parsing in comments → auto-subscribe + notify + emit `comment.mentioned` + daily-digest emails (depends on Email I/O). Watchlist flag (`CaseFlag(user_id, case_id, kind: watching|pinned)`). User preference model (`UserPreference` KV + `SavedFilter`).
+- **Depends on:** Foundations; Email I/O (for digests — in-app notifications work without email).
+- **V0 hooks:** events in timeline are ready to subscribe against; `comment.*` events exist.
+- **Key open questions:** notification verbosity defaults; "Slack-like" in-app presence indicators yes/no; mobile push (almost certainly no for v0 scope).
+
+### 6.15 Operational Search (cross-case FTS, attachment text extraction)
+
+- **What:** Postgres `tsvector` + GIN indexes on cases, parties, events, attachments (text extracted at upload via `pdfminer.six`, `python-docx`, etc.); `GET /api/search?q=&scope=…`; saved searches.
+- **Depends on:** Foundations; `ObjectStore.put` extension point (extraction runs there, same place virus scanning will hook).
+- **V0 hooks:** storage abstraction in place; attachment categories in place.
+- **Key open questions:** OCR on scanned PDFs (free vs. Azure Cognitive Services — residency matters); ranking strategy (tsvector default rank vs. BM25); search over anonymised parties (do we retain searchability after anonymisation?).
+
+### 6.16 Bulk Operations & Data Migration
+
+- **What:** multi-select on list views with bulk-assign, bulk-close, bulk-tag; case-prototype / starter-template model (`CasePrototype` entity with defaults per category); `scripts/import_legacy.py` for go-live migration of email/Excel complaints (reads a JSONL manifest → creates Case + Party + Attachment with `event.payload.imported_from` markers and idempotency keys).
+- **Depends on:** Foundations.
+- **V0 hooks:** `POST /api/admin/tasks:bulk-reassign` exists; CaseLink supports umbrella pattern.
+- **Key open questions:** migration dry-run mode; rollback strategy if an import batch is mis-mapped.
+
+### 6.17 Webhook out / integrations
 
 - **What:** outbound webhooks to other BIPT systems on event types (e.g., case closed → notify CRM). Possibly inbound webhooks from partner systems.
 - **Depends on:** Foundations.
 - **V0 hooks:** event stream ready to subscribe against.
 - **Key open questions:** delivery guarantees (at-least-once + idempotency?); auth/signing; retry policy.
 
-### 6.14 Additional items noted but not yet scoped
+### 6.18 Additional items noted but not yet scoped
 
 - **Public-facing complainant portal** (beyond intake form) — see case status, reply, upload more — larger than any single sub-project.
 - **Operator-facing portal** — companies log in to respond.
@@ -1137,6 +1331,29 @@ Each decision records the *why*, so future-us can judge edge cases without re-li
 
 ---
 
+**Missing-components amendments (after second three-agent review — operational practice / templating & components / process catalog):**
+
+65. **Structured closure taxonomy on `Case`.** Why: `status ∈ {draft|open|closed}` with a free-text note is not enough for a regulator — closures carry an outcome type (dismissed / resolved / forwarded / withdrawn / redirected / referred-ex-officio / …). v0 adds `Case.closure_reason` enum + `closure_note`, and the `set_case_status` DSL action requires `closure_reason` whenever `value=closed`. Operational-practice critic: MUST.
+66. **Admissibility gate as a first-class Case state.** Why: every regulator desk triages admissibility (jurisdiction, time-bar, duplicate, scope) before substantive handling. v0 adds `Case.admissibility_decision` enum + `admissibility_note` + `set_admissibility` DSL action + `admissibility_triage.yaml` seed scaffold running *before* the category-specific flow. Operational-practice critic: MUST.
+67. **`Case.priority` field with `urgent` value.** Why: urgent cases (ongoing DDoS, live disinformation spike) need a fast-track lane distinct from the standard flow. The urgent lane itself lands in §6.1, but the field is needed now so CEL transitions can discriminate, dashboards can filter, and trusted-flagger complaints can auto-start at `high`.
+68. **`CaseLink` entity for duplicate / related / parent-of / split-from / superseded-by relationships**, plus merge/split operations. Why: one incident generates hundreds of near-identical complaints; complainants file twice; a case may split into multiple investigations. Retrofitting this after v0 is painful — party-dedup is only half the picture. Operational-practice + components critics: MUST.
+69. **`Inquiry` entity as a lighter-weight sibling to `Case`.** Why: regulators receive a high volume of "is this my complaint or a question?" contacts; forcing them through the full Case model pollutes statistics and SLAs. `Inquiry` has short retention, minimal fields, and a `promote_to_case` path that seeds the Case from the inquiry. Operational-practice critic: SHOULD.
+70. **Trusted-flagger support as first-class** — `Party.is_trusted_flagger` + `trusted_flagger_designation_ref` + `CaseParticipant.role` extended to include `trusted_flagger`, `representative`, `represented_party`, `witness`. Why: DSA Article 22 mandates priority handling for notifications from trusted flaggers; BIPT publishes Belgium's designation list. Also covers representative/collective complaints (Test-Achats, consumer groups, NGOs). Operational-practice critic: SHOULD.
+71. **`CaseRecusal` + `User.out_of_office_until` + `User.delegate_user_id`.** Why: real desks handle conflict-of-interest recusals and staff-on-leave coverage daily; `§4.6.1` role rule is otherwise blind to these. Task-assignment logic consults both — recused users never receive tasks on that case; OOO users' tasks are offered to the delegate. Operational-practice critic: SHOULD.
+72. **Regulator-grade templating subsystem** (replaces the minimal `Template` entity). Why: every three-critic report converged here (and the user flagged it directly). v0 adds `TemplateSet` + `TemplateVersion` (with `draft|in_review|approved|retired` state machine) + `TemplateFragment` + `LetterheadProfile` + `variables_schema` (JSON Schema validated at DSL-load time and at render time) + stale-translation detection (sibling-language versions auto-flagged when canonical approves) + rendered-output audit (the rendered text or PDF attachment is stored on `template.rendered` events — "what we actually sent" is preserved). DSL binding (`render_template`) is now a contract, not a loose reference. Templating critic: MUST across 6 sub-items.
+73. **Seeded `telecom-consumer` + `postal` case categories.** Why: BIPT's pre-existing mandates; absence from seeds made the platform look DSA-only despite §2.1's multi-mandate framing. Telecom consumer complaints are likely the highest-volume category at launch.
+74. **`Decision` entity declared in v0 (workflow deferred to §6.13 Formal Enforcement).** Why: formal regulator acts carry a reference, signatory, publication status, appeal clock — `Case.status='closed'` is not a decision record. Declaring the entity now with stub CRUD avoids schema retrofit when the full workflow ships.
+75. **`ConfidentialityClaim` entity.** Why: operators and third parties routinely mark portions of their submissions as commercial secret / personal data / legal privilege. These markings drive what can appear in share bundles, published decisions, and FOIA releases. Without this entity, §6.5 share bundles and §6.13 decision publishing will leak protected content. Operational-practice critic: MUST.
+76. **`FormalDocument` entity** as the "document-of-record" primitive distinct from generic `Attachment + template.rendered`. Why: RFIs, formal referrals, and decisions have a lifecycle (drafted → issued → delivered → responded → closed) that generic attachments can't express. V0 declares the entity; the lifecycle ships with §6.1 (RFIs) and §6.13 (Decisions).
+77. **`schedule_triggers:` block in the DSL** for calendar-driven process spawning (annual reports, retention cleanups, periodic QA sampling, RFI-deadline sweeps). Why: `triggers:` was purely event-driven; annual/periodic work is calendar-driven. Shape reserved in v0; firing via §6.1 Timers' durable scheduler.
+78. **Four new §6 sub-projects added:** §6.13 Formal Enforcement (decisions, appeals, publication, DSA Transparency DB); §6.14 In-app Collaboration (notifications, @mentions, subscriptions); §6.15 Operational Search (cross-case FTS + attachment extraction); §6.16 Bulk Operations & Data Migration (multi-select actions + legacy import tooling for go-live). Previously-§6.13 Webhooks → §6.17; §6.14 additional items → §6.18.
+79. **Dashboard widgets extended** with `Admissibility pending` (queue-overload signal), `Urgent priority` (open urgent cases), `Translations pending` (admin view). Why: the three-critic process catalog made clear that regulator operations hinge on fast-triage visibility on admissibility and urgency.
+80. **Exports (CSV) ship in v0 API; XLSX/transparency-DB deferred.** Why: Council asks for data on day 30; CSV is trivial to stream from FastAPI and covers immediate needs. XLSX pretty-printing and the DSA Transparency DB JSON schema land with §6.13 Formal Enforcement.
+81. **Case reopen path via explicit action.** Why: real cases reopen when new evidence surfaces after closure; the spec previously had no mechanism. `POST /api/cases/{id}:reopen` with `reason` is admin-only and emits `case.reopened`. Closure metadata is retained for audit.
+82. **Process catalog seeded beyond DSA scaffold.** v0 ships `admissibility_triage.yaml` and seed categories for `telecom-consumer` + `postal`; the full catalog (AI Act, Data Act, RFI, urgent lane, cross-border referral, consent withdrawal, formal decision with appeal, annual reporting) is mapped across §6.1 / §6.2 / §6.4 / §6.13 as scaffolds land.
+
+---
+
 ## 8. Open questions
 
 To resolve either before planning or during implementation. Each has a reasonable default.
@@ -1166,6 +1383,16 @@ To resolve either before planning or during implementation. Each has a reasonabl
 23. **Event schema migration strategy when `schema_version` bumps** — do we provide upcaster functions in code, or explicit per-version renderers? *Default: per-version renderers; upcasters only added when two payload shapes must coexist across a real migration window.*
 24. **BIPT Council opt-out policy ratification** — Geoffrey is proposing the default; Council may adjust to opt-in-only, or restrict opt-out to specific categories. *Default: opt-out respected; toggle is configurable so the default flips without code change if ratification diverges.*
 25. **How to seed the first AI agent in §6.4** — when real providers land, which one first (Azure OpenAI in Belgium Central, an EU-hosted open-source model via a self-run endpoint, or Anthropic)? *Default: Azure OpenAI Belgium Central first — best DPA + residency + model quality story; revisit if Belgium region lags model availability.*
+26. **Closure reason taxonomy** — is the proposed enum (`out_of_scope | redirected | dismissed_abuse | dismissed_duplicate | dismissed_time_barred | resolved | forwarded | withdrawn | referred_ex_officio | admin_closed | other`) exhaustive and aligned with BIPT's reporting categories? *Default: ship as proposed; refine when the first annual report forces categorisation.*
+27. **Admissibility workflow — mandatory first state or optional?** — v0 seeds `admissibility_triage.yaml` but the DSA scaffold currently starts at `completeness_check`. Do we require every process to begin with admissibility, or is it a Complaint-Team-configured convention? *Default: convention-based (Complaint Team chooses per workflow); make mandatory if audit findings later push for it.*
+28. **Case merge reversibility window** — 7 days is the proposed default for `:split-from` undo after `:merge-into`. Right duration? *Default: 7 days; configurable via env.*
+29. **Confidentiality-claim reviewer authorisation** — who can review claims? V0 permits Complaint Team + admin; real regulator practice often has a dedicated legal-review role. *Default: current scope; formalise in the later RBAC sub-project.*
+30. **Holding-letter threshold** — default 80% of SLA elapsed to auto-generate holding letters (§6.1). Right threshold? *Default: 80%; configurable per category.*
+31. **Inquiry retention policy** — how long do inquiries live before anonymisation? *Default: 12 months from last contact; aligns with §6.10 anonymisation piggyback.*
+32. **Template approval authority** — for `official` category templates, should approval require Council member signoff or is admin-role sufficient? *Default: admin-role for v0; Council-approval role lands with RBAC refinement.*
+33. **PDF letterhead asset handling** — logos and fonts are assets that need versioning. Bundled in repo (with git-LFS for large files)? Separate asset store? *Default: bundled in `/assets/letterheads/` under git; LFS if needed.*
+34. **Trusted-flagger list source of truth** — is the designation list maintained in CORPUS or imported from an external BIPT register? *Default: imported from an external list via a scheduled job (lands with §6.1); v0 manual entry.*
+35. **Priority auto-promotion rules** — trusted-flagger complaints auto-start at `high`; are there other auto-rules (e.g., cases referencing "urgent" keywords, cases from certain party kinds)? *Default: trusted-flagger = high only in v0; extended rules are Complaint-Team configurable via the workflow DSL.*
 
 ---
 
@@ -1196,6 +1423,20 @@ To resolve either before planning or during implementation. Each has a reasonabl
 | **Entra ID** | Microsoft's name for Azure AD; the future staff auth provider. |
 | **WCAG 2.1 AA / AnySurfer** | Accessibility standard/label; Belgian federal-body obligation. |
 | **AzureBlob / ACR / Container Apps** | Azure services used in the future deploy sub-project. |
+| **Admissibility** | The regulator's judgment that a complaint is within competence and properly formed. Recorded on `Case.admissibility_decision`. |
+| **RFI** | Request for Information — a formal statutory instrument (DSA Art. 24, AI Act Art. 70, BIPT's enabling law) compelling a regulated entity to provide information by a deadline. |
+| **Trusted flagger** | DSA Art. 22 designation: an entity whose notifications platforms must process with priority. BIPT publishes the Belgian list. |
+| **ConfidentialityClaim** | A formal marking on a submission (commercial secret / personal data / legal privilege) that constrains share-bundle content and decision-publication redaction. |
+| **FormalDocument** | A document-of-record (RFI, decision, referral, notice) whose lifecycle is distinct from a generic Attachment; carries a reference, signatory, and delivery/response tracking. |
+| **TemplateSet / TemplateVersion / TemplateFragment** | The three-entity templating model: logical identity + reviewable multi-lingual versions + reusable sub-blocks. |
+| **Letterhead** | A PDF-rendering profile (logo, address block, font, signatory) applied to `pdf_letterhead` template outputs. |
+| **Inquiry** | An informal contact that hasn't (yet) become a formal complaint; lighter entity with optional promotion to Case. |
+| **Recusal** | A staff conflict-of-interest marker on a case — recused users are never routed tasks on that case. |
+| **Holding letter** | A "we're still on it, no decision yet, expected date X" note sent to a complainant when a response deadline is at risk — distinct from a reminder (reminder = to someone we're waiting on). |
+| **DSC / EBDS** | Digital Services Coordinator / European Board for Digital Services — DSA coordination counterparts. |
+| **DSA Transparency Database** | EU Commission system for platforms and authorities to publish statements of reasons on moderation decisions (DSA Art. 24). |
+| **Market Court** | Belgian appellate body hearing appeals against regulator decisions. |
+| **APD/GBA** | Belgian Data Protection Authority (Autorité de protection des données / Gegevensbeschermingsautoriteit) — frequent redirect target for GDPR-only complaints. |
 
 ---
 
